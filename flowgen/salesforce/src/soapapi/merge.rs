@@ -1,6 +1,8 @@
-//! Salesforce SOSL search processor.
+//! Salesforce SOAP API merge processor.
 //!
-//! Executes SOSL queries via the REST API and emits matching records as events.
+//! Merges duplicate SObject records (Account, Contact, Lead, Individual) into a
+//! single master record via the Salesforce SOAP API. Related records from the
+//! victim records are automatically reparented to the master.
 
 use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventBuilder, EventData, EventExt};
@@ -8,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error, Instrument};
 
-/// Errors for Salesforce SOSL search operations.
+/// Errors for Salesforce SOAP API merge operations.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -24,15 +26,10 @@ pub enum Error {
         #[source]
         source: salesforce_core::client::Error,
     },
-    #[error("Salesforce SOSL search failed: {source}")]
-    SearchOperation {
+    #[error("Salesforce SOAP merge operation failed: {source}")]
+    MergeOperation {
         #[source]
-        source: Box<salesforce_core::restapi::search::Error>,
-    },
-    #[error("Failed to serialize or deserialize data: {source}")]
-    SerdeExt {
-        #[source]
-        source: flowgen_core::serde::Error,
+        source: salesforce_core::soapapi::MergeError,
     },
     #[error(transparent)]
     EventError(#[from] flowgen_core::event::Error),
@@ -46,17 +43,19 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
-    #[error("Failed to build REST API client: {source}")]
-    RestClientBuild {
+    #[error("record_ids_to_merge must contain one or two IDs, got {count}")]
+    InvalidMergeCount { count: usize },
+    #[error("Failed to build SOAP API client: {source}")]
+    SoapClientBuild {
         #[source]
-        source: salesforce_core::restapi::ClientError,
+        source: salesforce_core::soapapi::ClientError,
     },
 }
 
-/// Event handler for processing individual SOSL search requests.
+/// Event handler for processing individual merge requests.
 pub struct EventHandler {
-    client: Arc<salesforce_core::restapi::Client>,
-    config: Arc<super::config::Search>,
+    client: Arc<salesforce_core::soapapi::Client>,
+    config: Arc<super::config::Merge>,
     tx: Option<Sender<Event>>,
     current_task_id: usize,
     sfdc_client: Arc<tokio::sync::Mutex<salesforce_core::client::Client>>,
@@ -81,33 +80,45 @@ impl EventHandler {
                 .render(&event_value)
                 .map_err(|e| Error::ConfigRender { source: e })?;
 
-            let response =
-                self.client
-                    .search(&config.query)
-                    .await
-                    .map_err(|e| Error::SearchOperation {
-                        source: Box::new(e),
-                    })?;
+            let count = config.record_ids_to_merge.len();
+            if count == 0 || count > 2 {
+                return Err(Error::InvalidMergeCount { count });
+            }
 
-            let resp = serde_json::to_value(&response).map_err(|e| Error::SerdeExt {
-                source: flowgen_core::serde::Error::Serde { source: e },
-            })?;
+            let response = self
+                .client
+                .merge(
+                    &config.sobject_type,
+                    &config.master_record_id,
+                    &config.record_ids_to_merge,
+                    config.master_field_overrides.as_ref(),
+                    config.allow_duplicate_save,
+                )
+                .await
+                .map_err(|e| Error::MergeOperation { source: e })?;
+
+            let resp = serde_json::json!({
+                "success": response.success,
+                "merged_record_ids": response.merged_record_ids,
+                "updated_related_ids": response.updated_related_ids,
+            });
 
             let mut e = EventBuilder::new()
                 .data(EventData::Json(resp))
                 .subject(config.name.to_owned())
+                .id(config.master_record_id.clone())
                 .task_id(self.current_task_id)
                 .task_type(self.task_type)
                 .build()?;
 
             match self.tx {
+                Some(_) => {
+                    e.completion_tx = completion_tx_arc.clone();
+                }
                 None => {
                     if let Some(arc) = completion_tx_arc.as_ref() {
                         arc.signal_completion(e.data_as_json().ok());
                     }
-                }
-                Some(_) => {
-                    e.completion_tx = completion_tx_arc.clone();
                 }
             }
 
@@ -121,10 +132,10 @@ impl EventHandler {
     }
 }
 
-/// Salesforce SOSL search processor.
+/// Salesforce SOAP API merge processor.
 #[derive(Debug)]
 pub struct Processor {
-    config: Arc<super::config::Search>,
+    config: Arc<super::config::Merge>,
     rx: Receiver<Event>,
     tx: Option<Sender<Event>>,
     task_id: usize,
@@ -151,15 +162,15 @@ impl flowgen_core::task::runner::Runner for Processor {
             .await
             .map_err(|e| Error::SalesforceAuth { source: e })?;
 
-        let rest_client = salesforce_core::restapi::ClientBuilder::new(sfdc_client.clone())
+        let soap_client = salesforce_core::soapapi::ClientBuilder::new(sfdc_client.clone())
             .build()
-            .map_err(|e| Error::RestClientBuild { source: e })?;
+            .map_err(|e| Error::SoapClientBuild { source: e })?;
 
         let event_handler = EventHandler {
             config: Arc::clone(&self.config),
             current_task_id: self.task_id,
             tx: self.tx.clone(),
-            client: Arc::new(rest_client),
+            client: Arc::new(soap_client),
             sfdc_client: Arc::new(tokio::sync::Mutex::new(sfdc_client)),
             task_type: self.task_type,
             task_context: Arc::clone(&self.task_context),
@@ -176,7 +187,7 @@ impl flowgen_core::task::runner::Runner for Processor {
             match self.init().await {
                 Ok(handler) => Ok(handler),
                 Err(e) => {
-                    error!(error = %e, "Failed to initialize SOSL search processor.");
+                    error!(error = %e, "Failed to initialize SOAP API merge processor.");
                     Err(tokio_retry::RetryError::transient(e))
                 }
             }
@@ -202,12 +213,9 @@ impl flowgen_core::task::runner::Runner for Processor {
                                     match event_handler.handle(event_clone.clone()).await {
                                         Ok(result) => Ok(result),
                                         Err(e) => {
-                                            error!(error = %e, "Failed to process SOSL search.");
-                                            let needs_reconnect = matches!(&e, Error::SalesforceAuth { .. })
-                                                || matches!(&e,
-                                                    Error::SearchOperation { source }
-                                                        if matches!(source.as_ref(), salesforce_core::restapi::search::Error::Auth { .. })
-                                                );
+                                            error!(error = %e, "Failed to process SOAP merge operation.");
+                                            let needs_reconnect =
+                                                matches!(&e, Error::SalesforceAuth { .. });
 
                                             if needs_reconnect {
                                                 let mut sfdc_client =
@@ -216,9 +224,13 @@ impl flowgen_core::task::runner::Runner for Processor {
                                                     (*sfdc_client).reconnect().await
                                                 {
                                                     error!(error = %reconnect_err, "Failed to reconnect.");
-                                                    return Err(tokio_retry::RetryError::transient(Error::SalesforceAuth {
-                                                        source: reconnect_err,
-                                                    }));
+                                                    return Err(
+                                                        tokio_retry::RetryError::transient(
+                                                            Error::SalesforceAuth {
+                                                                source: reconnect_err,
+                                                            },
+                                                        ),
+                                                    );
                                                 }
                                             }
                                             Err(tokio_retry::RetryError::transient(e))
@@ -228,7 +240,7 @@ impl flowgen_core::task::runner::Runner for Processor {
                                 .await;
 
                                 if let Err(err) = result {
-                                    error!(error = %err, "SOSL search failed after all retry attempts.");
+                                    error!(error = %err, "SOAP merge operation failed after all retry attempts.");
                                     let mut error_event = event_clone.clone();
                                     error_event.error = Some(err.to_string());
                                     if let Some(ref tx) = event_handler.tx {
@@ -246,9 +258,9 @@ impl flowgen_core::task::runner::Runner for Processor {
     }
 }
 
-/// Builder for creating search Processor instances.
+/// Builder for creating merge Processor instances.
 pub struct ProcessorBuilder {
-    config: Option<Arc<super::config::Search>>,
+    config: Option<Arc<super::config::Merge>>,
     rx: Option<Receiver<Event>>,
     tx: Option<Sender<Event>>,
     task_id: Option<usize>,
@@ -274,7 +286,7 @@ impl ProcessorBuilder {
         }
     }
 
-    pub fn config(mut self, config: Arc<super::config::Search>) -> Self {
+    pub fn config(mut self, config: Arc<super::config::Merge>) -> Self {
         self.config = Some(config);
         self
     }
@@ -326,140 +338,5 @@ impl ProcessorBuilder {
                 .task_type
                 .ok_or_else(|| Error::MissingBuilderAttribute("task_type".to_string()))?,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::config::Search;
-
-    // ── Config Deserialization ───────────────────────────────────────
-
-    #[test]
-    fn config_deser_minimal() {
-        let json = r#"{
-            "name": "find_accounts",
-            "credentials_path": "/path/to/creds.json",
-            "query": "FIND {Acme} IN ALL FIELDS RETURNING Account(Id, Name)"
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        assert_eq!(config.name, "find_accounts");
-        assert_eq!(
-            config.credentials_path,
-            std::path::PathBuf::from("/path/to/creds.json")
-        );
-        assert_eq!(
-            config.query,
-            "FIND {Acme} IN ALL FIELDS RETURNING Account(Id, Name)"
-        );
-        assert!(config.depends_on.is_none());
-        assert!(config.retry.is_none());
-    }
-
-    #[test]
-    fn config_deser_with_depends_on() {
-        let json = r#"{
-            "name": "search_contacts",
-            "credentials_path": "/creds.json",
-            "query": "FIND {test}",
-            "depends_on": ["upstream_task"]
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        let deps = config.depends_on.unwrap();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0], "upstream_task");
-    }
-
-    #[test]
-    fn config_deser_with_retry() {
-        let json = r#"{
-            "name": "retryable_search",
-            "credentials_path": "/creds.json",
-            "query": "FIND {test}",
-            "retry": { "max_retries": 5, "initial_interval": "2s" }
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        assert!(config.retry.is_some());
-    }
-
-    #[test]
-    fn config_deser_missing_name_fails() {
-        let json = r#"{
-            "credentials_path": "/creds.json",
-            "query": "FIND {test}"
-        }"#;
-        let result = serde_json::from_str::<Search>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn config_deser_missing_credentials_path_fails() {
-        let json = r#"{
-            "name": "test",
-            "query": "FIND {test}"
-        }"#;
-        let result = serde_json::from_str::<Search>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn config_deser_missing_query_fails() {
-        let json = r#"{
-            "name": "test",
-            "credentials_path": "/creds.json"
-        }"#;
-        let result = serde_json::from_str::<Search>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn config_roundtrip_serde() {
-        let json = r#"{
-            "name": "roundtrip",
-            "credentials_path": "/creds.json",
-            "query": "FIND {Acme} RETURNING Account"
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        let serialized = serde_json::to_string(&config).unwrap();
-        let deserialized: Search = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(config, deserialized);
-    }
-
-    #[test]
-    fn config_deser_with_handlebars_template_in_query() {
-        let json = r#"{
-            "name": "templated_search",
-            "credentials_path": "/creds.json",
-            "query": "FIND {{{event.data.search_term}}} IN ALL FIELDS RETURNING Account(Id, Name)"
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        assert!(config.query.contains("{{event.data.search_term}}"));
-    }
-
-    #[test]
-    fn config_deser_with_multiple_depends_on() {
-        let json = r#"{
-            "name": "multi_dep",
-            "credentials_path": "/creds.json",
-            "query": "FIND {test}",
-            "depends_on": ["task_a", "task_b", "task_c"]
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        let deps = config.depends_on.unwrap();
-        assert_eq!(deps.len(), 3);
-        assert_eq!(deps[2], "task_c");
-    }
-
-    #[test]
-    fn config_deser_empty_depends_on_is_empty_vec() {
-        let json = r#"{
-            "name": "empty_dep",
-            "credentials_path": "/creds.json",
-            "query": "FIND {test}",
-            "depends_on": []
-        }"#;
-        let config: Search = serde_json::from_str(json).unwrap();
-        let deps = config.depends_on.unwrap();
-        assert!(deps.is_empty());
     }
 }
