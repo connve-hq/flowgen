@@ -101,6 +101,14 @@ export const navigation: NavSection[] = [
 		]
 	},
 	{
+		title: 'MongoDB',
+		icon: '/icons/mongodb.svg',
+		items: [
+			{ title: 'Reader', href: '/mongo/reader' },
+			{ title: 'Writer', href: '/mongo/writer' }
+		]
+	},
+	{
 		title: 'MSSQL',
 		icon: '/icons/mssql.svg',
 		items: [
