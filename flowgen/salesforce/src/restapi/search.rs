@@ -172,15 +172,18 @@ impl flowgen_core::task::runner::Runner for Processor {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(retry_config.strategy(), || async {
-            match self.init().await {
-                Ok(handler) => Ok(handler),
-                Err(e) => {
-                    error!(error = %e, "Failed to initialize SOSL search processor.");
-                    Err(tokio_retry::RetryError::transient(e))
+        let event_handler = match tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize SOSL search processor.");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(handler) => Arc::new(handler),
@@ -189,6 +192,7 @@ impl flowgen_core::task::runner::Runner for Processor {
             }
         };
 
+        let mut handlers = Vec::new();
         loop {
             match self.rx.recv().await {
                 Some(event) => {
@@ -196,7 +200,7 @@ impl flowgen_core::task::runner::Runner for Processor {
                         let event_handler = Arc::clone(&event_handler);
                         let retry_strategy = retry_config.strategy();
                         let event_clone = event.clone();
-                        tokio::spawn(
+                        let handle = tokio::spawn(
                             async move {
                                 let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                     match event_handler.handle(event_clone.clone()).await {
@@ -238,9 +242,13 @@ impl flowgen_core::task::runner::Runner for Processor {
                             }
                             .instrument(tracing::Span::current()),
                         );
+                        handlers.push(handle);
                     }
                 }
-                None => return Ok(()),
+                None => {
+                    futures_util::future::join_all(handlers).await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -326,5 +334,140 @@ impl ProcessorBuilder {
                 .task_type
                 .ok_or_else(|| Error::MissingBuilderAttribute("task_type".to_string()))?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::config::Search;
+
+    // ── Config Deserialization ───────────────────────────────────────
+
+    #[test]
+    fn config_deser_minimal() {
+        let json = r#"{
+            "name": "find_accounts",
+            "credentials_path": "/path/to/creds.json",
+            "query": "FIND {Acme} IN ALL FIELDS RETURNING Account(Id, Name)"
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        assert_eq!(config.name, "find_accounts");
+        assert_eq!(
+            config.credentials_path,
+            std::path::PathBuf::from("/path/to/creds.json")
+        );
+        assert_eq!(
+            config.query,
+            "FIND {Acme} IN ALL FIELDS RETURNING Account(Id, Name)"
+        );
+        assert!(config.depends_on.is_none());
+        assert!(config.retry.is_none());
+    }
+
+    #[test]
+    fn config_deser_with_depends_on() {
+        let json = r#"{
+            "name": "search_contacts",
+            "credentials_path": "/creds.json",
+            "query": "FIND {test}",
+            "depends_on": ["upstream_task"]
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        let deps = config.depends_on.unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], "upstream_task");
+    }
+
+    #[test]
+    fn config_deser_with_retry() {
+        let json = r#"{
+            "name": "retryable_search",
+            "credentials_path": "/creds.json",
+            "query": "FIND {test}",
+            "retry": { "max_retries": 5, "initial_interval": "2s" }
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        assert!(config.retry.is_some());
+    }
+
+    #[test]
+    fn config_deser_missing_name_fails() {
+        let json = r#"{
+            "credentials_path": "/creds.json",
+            "query": "FIND {test}"
+        }"#;
+        let result = serde_json::from_str::<Search>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_deser_missing_credentials_path_fails() {
+        let json = r#"{
+            "name": "test",
+            "query": "FIND {test}"
+        }"#;
+        let result = serde_json::from_str::<Search>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_deser_missing_query_fails() {
+        let json = r#"{
+            "name": "test",
+            "credentials_path": "/creds.json"
+        }"#;
+        let result = serde_json::from_str::<Search>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_roundtrip_serde() {
+        let json = r#"{
+            "name": "roundtrip",
+            "credentials_path": "/creds.json",
+            "query": "FIND {Acme} RETURNING Account"
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_string(&config).unwrap();
+        let deserialized: Search = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn config_deser_with_handlebars_template_in_query() {
+        let json = r#"{
+            "name": "templated_search",
+            "credentials_path": "/creds.json",
+            "query": "FIND {{{event.data.search_term}}} IN ALL FIELDS RETURNING Account(Id, Name)"
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        assert!(config.query.contains("{{event.data.search_term}}"));
+    }
+
+    #[test]
+    fn config_deser_with_multiple_depends_on() {
+        let json = r#"{
+            "name": "multi_dep",
+            "credentials_path": "/creds.json",
+            "query": "FIND {test}",
+            "depends_on": ["task_a", "task_b", "task_c"]
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        let deps = config.depends_on.unwrap();
+        assert_eq!(deps.len(), 3);
+        assert_eq!(deps[2], "task_c");
+    }
+
+    #[test]
+    fn config_deser_empty_depends_on_is_empty_vec() {
+        let json = r#"{
+            "name": "empty_dep",
+            "credentials_path": "/creds.json",
+            "query": "FIND {test}",
+            "depends_on": []
+        }"#;
+        let config: Search = serde_json::from_str(json).unwrap();
+        let deps = config.depends_on.unwrap();
+        assert!(deps.is_empty());
     }
 }

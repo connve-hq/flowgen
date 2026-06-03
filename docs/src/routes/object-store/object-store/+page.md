@@ -6,9 +6,9 @@ Read, write, list, and move files on S3, GCS, Azure Blob Storage, or local files
 
 | Operation | Description |
 |---|---|
-| `read` | Read a file and emit its content as events (supports CSV, Parquet, Avro, JSON). |
+| `read` | Read a single file and emit its content as events (CSV, Parquet, Avro, JSON). Path must point to a concrete file — no wildcards or directory traversal. To read multiple files, use `list → iterate → read`. |
 | `write` | Write event data to a file. |
-| `list` | List files matching a path or glob pattern. |
+| `list` | List files at a path prefix. Supports glob patterns (`*.parquet`) and recursive traversal into nested subdirectories. |
 | `move` | Copy files to a destination, then delete the originals. |
 
 ## Configuration
@@ -31,9 +31,11 @@ Read, write, list, and move files on S3, GCS, Azure Blob Storage, or local files
 | `credentials_path` | string | | Path to credentials file (GCS service account, AWS credentials). |
 | `client_options` | map | | Additional client options (region, endpoint, etc.). |
 | `depends_on` | list | | Upstream task names. |
-| `retry` | object | | Retry configuration. |
+| `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |
 
 ### Read fields
+
+Read requires a concrete file path (e.g. `gs://bucket/dir/file.csv`). It does not support wildcards or directory listing. To process multiple files, chain `list → iterate → read` and template the path from the list output.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -41,6 +43,12 @@ Read, write, list, and move files on S3, GCS, Azure Blob Storage, or local files
 | `has_header` | bool | true | Whether CSV has a header row. |
 | `delimiter` | string | `,` | CSV delimiter character. |
 | `delete_after_read` | bool | false | Delete the file after reading. |
+
+### List fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `recursive` | bool | false | Traverse nested subdirectories. When false, only lists files at the immediate prefix level. |
 
 ### Write fields
 
@@ -115,6 +123,17 @@ Values from `client_options` take precedence over the credentials file.
 
 When no `credentials_path` or inline AWS keys in `client_options` are provided, the client resolves credentials automatically in this order: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` environment variables, IRSA (EKS web identity token), EKS Pod Identity, ECS task roles, or EC2 instance profiles. You still need `aws_region` in `client_options`.
 
+S3 requests use virtual-hosted style URLs by default (`{bucket}.s3.{region}.amazonaws.com`), matching the AWS SDK convention. Set `aws_virtual_hosted_style_request: "false"` in `client_options` for path-style URLs (e.g. MinIO, LocalStack).
+
+**Additional `client_options` for S3:**
+
+| Key | Description |
+|---|---|
+| `aws_region` | AWS region (required unless `AWS_REGION` / `AWS_DEFAULT_REGION` is set). |
+| `aws_role_session_name` | Override the STS session name for IRSA (`AssumeRoleWithWebIdentity`). Defaults to `WebIdentitySession`. |
+| `aws_virtual_hosted_style_request` | `"true"` (default) for virtual-hosted URLs, `"false"` for path-style. |
+| `aws_endpoint` | Custom S3 endpoint URL (for S3-compatible stores). |
+
 ### Local filesystem
 
 No credentials needed. Use `file://` paths:
@@ -169,6 +188,42 @@ No credentials needed. Use `file://` paths:
 
 Returns `{path, files}` where each file has `location`, `last_modified`, `size`, and `e_tag`.
 
+### List files recursively
+
+When files are spread across nested subdirectories (e.g. `bucket/a/file.csv`, `bucket/b/c/file.csv`), use `recursive: true` to traverse the entire tree:
+
+```yaml
+- object_store:
+    name: find_all_files
+    operation: list
+    path: gs://my-bucket/data/
+    recursive: true
+    credentials_path: /path/to/gcs-creds.json
+```
+
+### Read multiple files (list + iterate + read)
+
+Read requires a concrete file path — it cannot list or traverse directories. To process multiple files, chain list, iterate over the results, and read each file using a template:
+
+```yaml
+- object_store:
+    name: find_files
+    operation: list
+    path: gs://my-bucket/data/
+    recursive: true
+    credentials_path: /path/to/gcs-creds.json
+
+- iterate:
+    name: each_file
+    iterate_key: files
+
+- object_store:
+    name: read_file
+    operation: read
+    path: "gs://my-bucket{{event.data.location}}"
+    credentials_path: /path/to/gcs-creds.json
+```
+
 ### Move files
 
 ```yaml
@@ -190,3 +245,26 @@ Returns `{path, files}` where each file has `location`, `last_modified`, `size`,
     destination: gs://my-bucket/archive/
     credentials_path: /path/to/gcs-creds.json
 ```
+
+## Output
+
+### Read
+
+| Format | Crate | Description |
+|---|---|---|
+| [Arrow RecordBatch](https://docs.rs/arrow/latest/arrow/record_batch/struct.RecordBatch.html) / [JSON](https://docs.rs/serde_json/latest/serde_json/enum.Value.html) | [object_store](https://docs.rs/object_store/latest/object_store/) | File contents. Format depends on source file type (Parquet, ORC, CSV, JSON). Each record batch becomes one event. |
+
+### Write
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | Written file path. |
+| `size` | int | Bytes written. |
+| `e_tag` | string / null | S3 ETag if available. |
+
+### List
+
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | Pattern searched. |
+| `files` | array | Matched files, each with `location`, `last_modified`, `size`, and `e_tag`. |

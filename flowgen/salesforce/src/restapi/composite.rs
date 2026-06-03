@@ -614,15 +614,18 @@ impl flowgen_core::task::runner::Runner for Processor {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(retry_config.strategy(), || async {
-            match self.init().await {
-                Ok(handler) => Ok(handler),
-                Err(e) => {
-                    error!(error = %e, "Failed to initialize Composite API processor");
-                    Err(tokio_retry::RetryError::transient(e))
+        let event_handler = match tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize Composite API processor");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(handler) => Arc::new(handler),
@@ -631,6 +634,7 @@ impl flowgen_core::task::runner::Runner for Processor {
             }
         };
 
+        let mut handlers = Vec::new();
         loop {
             match self.rx.recv().await {
                 Some(event) => {
@@ -638,7 +642,7 @@ impl flowgen_core::task::runner::Runner for Processor {
                         let event_handler = Arc::clone(&event_handler);
                         let retry_strategy = retry_config.strategy();
                         let event_clone = event.clone();
-                        tokio::spawn(
+                        let handle = tokio::spawn(
                             async move {
                                 let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                     match event_handler.handle(event_clone.clone()).await {
@@ -680,9 +684,13 @@ impl flowgen_core::task::runner::Runner for Processor {
                             }
                             .instrument(tracing::Span::current()),
                         );
+                        handlers.push(handle);
                     }
                 }
-                None => return Ok(()),
+                None => {
+                    futures_util::future::join_all(handlers).await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -767,5 +775,191 @@ impl ProcessorBuilder {
                 .task_type
                 .ok_or_else(|| Error::MissingBuilderAttribute("task_type".to_string()))?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_failures_all_success() {
+        let resp = serde_json::json!([
+            {"success": true, "id": "001abc"},
+            {"success": true, "id": "001def"}
+        ]);
+        EventHandler::log_failures(&resp);
+    }
+
+    #[test]
+    fn test_log_failures_one_failure() {
+        let resp = serde_json::json!([
+            {"success": true, "id": "001abc"},
+            {"success": false, "errors": [{"message": "REQUIRED_FIELD_MISSING"}]}
+        ]);
+        EventHandler::log_failures(&resp);
+    }
+
+    #[test]
+    fn test_log_failures_mixed() {
+        let resp = serde_json::json!([
+            {"success": false, "errors": [{"message": "err1"}]},
+            {"success": true, "id": "001abc"},
+            {"success": false, "errors": [{"message": "err2"}]}
+        ]);
+        EventHandler::log_failures(&resp);
+    }
+
+    #[test]
+    fn test_log_failures_empty_array() {
+        EventHandler::log_failures(&serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_log_failures_non_array() {
+        EventHandler::log_failures(&serde_json::json!({"not": "an array"}));
+        EventHandler::log_failures(&serde_json::json!("string"));
+        EventHandler::log_failures(&serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_config_create_with_records() {
+        let json = r#"{
+            "name": "batch_create",
+            "operation": "create",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "payload": [
+                {"attributes": {"type": "Account"}, "Name": "Acme"},
+                {"attributes": {"type": "Account"}, "Name": "Globex"}
+            ]
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::CompositeOperation::Create
+        );
+        match config.payload {
+            Some(super::super::config::CompositePayload::Records(ref records)) => {
+                assert_eq!(records.len(), 2);
+            }
+            _ => panic!("expected Records payload"),
+        }
+    }
+
+    #[test]
+    fn test_config_create_from_event() {
+        let json = r#"{
+            "name": "batch_create",
+            "operation": "create",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "payload": { "from_event": true }
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        match config.payload {
+            Some(super::super::config::CompositePayload::FromEvent { from_event }) => {
+                assert!(from_event);
+            }
+            _ => panic!("expected FromEvent payload"),
+        }
+    }
+
+    #[test]
+    fn test_config_get() {
+        let json = r#"{
+            "name": "batch_get",
+            "operation": "get",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "sobject_type": "Account",
+            "ids": ["001abc", "001def"],
+            "fields": ["Id", "Name"]
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::CompositeOperation::Get
+        );
+        assert_eq!(config.sobject_type.as_deref(), Some("Account"));
+        assert_eq!(config.ids.as_ref().unwrap().len(), 2);
+        assert_eq!(config.fields.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_config_upsert() {
+        let json = r#"{
+            "name": "batch_upsert",
+            "operation": "upsert",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "sobject_type": "Contact",
+            "external_id_field": "ExternalId__c",
+            "payload": [
+                {"attributes": {"type": "Contact"}, "ExternalId__c": "EXT-001", "FirstName": "Alice"}
+            ]
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::CompositeOperation::Upsert
+        );
+        assert_eq!(config.external_id_field.as_deref(), Some("ExternalId__c"));
+    }
+
+    #[test]
+    fn test_config_delete() {
+        let json = r#"{
+            "name": "batch_delete",
+            "operation": "delete",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "ids": ["001abc", "001def"]
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::CompositeOperation::Delete
+        );
+        assert_eq!(config.ids.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_config_tree() {
+        let json = r#"{
+            "name": "tree_create",
+            "operation": "tree",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "sobject_type": "Account",
+            "payload": [
+                {"attributes": {"type": "Account", "referenceId": "ref1"}, "Name": "Parent"}
+            ]
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::CompositeOperation::Tree
+        );
+        assert_eq!(config.sobject_type.as_deref(), Some("Account"));
+    }
+
+    #[test]
+    fn test_config_all_or_none() {
+        let json = r#"{
+            "name": "batch_create",
+            "operation": "create",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "all_or_none": true,
+            "payload": { "from_event": true }
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert_eq!(config.all_or_none, Some(true));
+    }
+
+    #[test]
+    fn test_config_all_or_none_absent() {
+        let json = r#"{
+            "name": "batch_create",
+            "operation": "create",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "payload": { "from_event": true }
+        }"#;
+        let config: super::super::config::Composite = serde_json::from_str(json).unwrap();
+        assert!(config.all_or_none.is_none());
     }
 }

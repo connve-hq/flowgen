@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.117.0
+
+### Features
+
+- **Startup jitter for all background tasks.** Every background task now
+  sleeps a random duration (up to `initial_backoff`) before its first
+  initialization attempt. This staggers connections across flows and
+  replicas to avoid thundering-herd login storms on external services.
+  Blocking tasks (`http_webhook`, `mcp_tool`, `ai_gateway`) and
+  `generate` tasks skip the jitter. The jitter is automatic and requires
+  no configuration.
+
+- **Exponential reconnect backoff for subscribers.** NATS JetStream and
+  Salesforce PubSub subscribers now use exponential backoff (capped at
+  5 minutes) when reconnecting after connection loss, replacing the
+  previous flat `initial_backoff` sleep. Each successful reconnect resets
+  the backoff.
+
+- **AGENTS.md.** Committed agent instructions (code quality standards and
+  architecture reference) to the repository root so they are shared
+  across all AI coding tools.
+
+## 0.116.0
+
+### Features
+
+- **Object store recursive listing.** New `recursive: true` option on
+  `object_store` list operations traverses nested subdirectories instead of
+  listing only the immediate prefix level. Enables `list → iterate → read`
+  patterns on directory trees of unknown depth.
+
+- **Pipeline tracing context.** `gcp_bigquery_query` now logs `num_rows`,
+  `iterate` logs `array_length`, and `nats_jetstream_publisher` logs `subject`
+  and `sequence` on each event — making it straightforward to trace row counts
+  through a fan-out pipeline.
+
+### Fixes
+
+- **S3 virtual-hosted style requests by default.** S3 requests now use
+  virtual-hosted style URLs (`{bucket}.s3.{region}.amazonaws.com`)
+  matching the AWS SDK default. Previously path-style URLs were used,
+  which can fail against bucket policies or VPC endpoint policies that
+  expect virtual-hosted requests. Override with
+  `aws_virtual_hosted_style_request: "false"` in `client_options`.
+
+- **All processors now await spawned tasks on channel close.**
+  Previously most processors used fire-and-forget `tokio::spawn` without
+  collecting handles. All processors now collect `JoinHandle`s and await
+  them when the input channel closes or cancellation is signalled,
+  matching the pattern already used by `nats_jetstream_publisher`.
+
+## 0.115.0
+
+### Features
+
+- **Salesforce SOAP API merge.** New `salesforce_soapapi_merge` task merges
+  duplicate SObject records (Account, Contact, Lead, Individual) into a single
+  master record via the Salesforce SOAP API. Related records are automatically
+  reparented to the master. Supports field overrides and duplicate detection bypass.
+
+### Fixes
+
+- **BigQuery Storage Write: silent data loss on type mismatch.**
+  `encode_scalar_value` now returns typed errors (`FieldTypeMismatch`,
+  `FieldBase64Decode`) instead of silently skipping fields when JSON
+  values don't match the expected BigQuery column type. Previously a
+  string in an INT64 column was quietly dropped.
+
+- **BigQuery Storage Write: nested RECORD/STRUCT support.**
+  `build_proto_descriptor` and `json_to_proto_bytes` now recursively
+  handle nested RECORD/STRUCT fields. Previously `nested_type: vec![]`
+  was hardcoded, silently dropping all data in RECORD columns.
+
+### Dependencies
+
+- Upgraded `salesforce_core` from 0.13.6 to 0.14.0 (adds `soapapi::Client::merge()`).
+
 ## 0.114.0
 
 ### Features
@@ -7,6 +84,23 @@
 - **`timestamp_format` Rhai function.** Format any Unix timestamp with a
   custom format string: `timestamp_format(timestamp_now(), "%Y-%m-%d %H:%M:%S")`.
   Uses [chrono strftime](https://docs.rs/chrono/latest/chrono/format/strftime/index.html) syntax.
+
+### Docs
+
+- Added concrete output format tables to all 24 task documentation pages
+  with links to underlying crate docs (arrow, serde_json, salesforce_core,
+  async-nats, rhai, object_store, reqwest, tiberius).
+- Added retry configuration links to all task configuration tables.
+- Added `identify()` to PostHog integration so newsletter signups create
+  persons instead of anonymous UUIDs.
+
+### CI
+
+- Fixed release notes shell interpolation bug — commit messages with
+  backticks or special characters no longer break `gh release create`.
+  Uses `--notes-file` instead of inline `--notes`.
+- Added docs CI pipeline (`docs-ci.yml`) — runs `svelte-check` and build
+  on PRs that touch `docs/`.
 
 ## 0.113.0
 

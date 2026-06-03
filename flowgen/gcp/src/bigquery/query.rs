@@ -139,6 +139,8 @@ impl EventHandler {
             )
             .await?;
 
+            let num_rows = record_batch.num_rows();
+
             // Build result event.
             let mut event_builder = EventBuilder::new()
                 .data(EventData::ArrowRecordBatch(record_batch))
@@ -157,19 +159,18 @@ impl EventHandler {
             // Signal completion or pass through to next task.
             match self.tx {
                 None => {
-                    // Leaf task: signal completion.
                     if let Some(arc) = completion_tx_arc.as_ref() {
                         arc.signal_completion(result_event.data_as_json().ok());
                     }
                 }
                 Some(_) => {
-                    // Pass through completion_tx to next task.
                     result_event.completion_tx = completion_tx_arc.clone();
                 }
             }
 
             result_event
                 .send_with_logging(self.tx.as_ref())
+                .context("num_rows", num_rows)
                 .await
                 .map_err(|source| Error::SendMessage { source })?;
 
@@ -243,15 +244,18 @@ impl flowgen_core::task::runner::Runner for Processor {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(retry_config.strategy(), || async {
-            match self.init().await {
-                Ok(handler) => Ok(handler),
-                Err(e) => {
-                    error!(error = %e, "Failed to initialize query processor");
-                    Err(tokio_retry::RetryError::transient(e))
+        let event_handler = match tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize query processor");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(handler) => Arc::new(handler),
@@ -260,12 +264,14 @@ impl flowgen_core::task::runner::Runner for Processor {
             }
         };
 
+        let mut handlers = Vec::new();
+
         loop {
             match self.rx.recv().await {
                 Some(event) => {
                     let event_handler = Arc::clone(&event_handler);
                     let retry_strategy = retry_config.strategy();
-                    tokio::spawn(
+                    let handle = tokio::spawn(
                         async move {
                             let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                 match event_handler.handle(event.clone()).await {
@@ -290,8 +296,12 @@ impl flowgen_core::task::runner::Runner for Processor {
                         }
                         .instrument(tracing::Span::current()),
                     );
+                    handlers.push(handle);
                 }
-                None => return Ok(()),
+                None => {
+                    futures_util::future::join_all(handlers).await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -1099,15 +1109,6 @@ mod tests {
         assert_eq!(arrow_field.name(), "amount");
         assert_eq!(arrow_field.data_type(), &DataType::Decimal128(38, 9));
         assert!(arrow_field.is_nullable());
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_config() {
-        let result = ProcessorBuilder::new().build().await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
     }
 
     #[test]

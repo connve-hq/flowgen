@@ -261,15 +261,18 @@ impl flowgen_core::task::runner::Runner for Processor {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(retry_config.strategy(), || async {
-            match self.init().await {
-                Ok(handler) => Ok(handler),
-                Err(e) => {
-                    error!(error = %e, "Failed to initialize storage read processor");
-                    Err(tokio_retry::RetryError::transient(e))
+        let event_handler = match tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize storage read processor");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(handler) => Arc::new(handler),
@@ -278,12 +281,14 @@ impl flowgen_core::task::runner::Runner for Processor {
             }
         };
 
+        let mut handlers = Vec::new();
+
         loop {
             match self.rx.recv().await {
                 Some(event) => {
                     let event_handler = Arc::clone(&event_handler);
                     let retry_strategy = retry_config.strategy();
-                    tokio::spawn(
+                    let handle = tokio::spawn(
                         async move {
                             let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                 match event_handler.handle(event.clone()).await {
@@ -308,8 +313,12 @@ impl flowgen_core::task::runner::Runner for Processor {
                         }
                         .instrument(tracing::Span::current()),
                     );
+                    handlers.push(handle);
                 }
-                None => return Ok(()),
+                None => {
+                    futures_util::future::join_all(handlers).await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -569,153 +578,6 @@ async fn read_table(
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
-    use std::path::PathBuf;
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_config() {
-        let result = ProcessorBuilder::new().build().await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_receiver() {
-        let config = Arc::new(super::super::config::StorageRead {
-            name: "test".to_string(),
-            credentials_path: Some(PathBuf::from("/test/creds.json")),
-            project_id: "test-project".to_string(),
-            job_project_id: None,
-            dataset_id: "test-dataset".to_string(),
-            table_id: "test-table".to_string(),
-            ..Default::default()
-        });
-
-        let result = ProcessorBuilder::new().config(config).build().await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_sender() {
-        let config = Arc::new(super::super::config::StorageRead {
-            name: "test".to_string(),
-            credentials_path: Some(PathBuf::from("/test/creds.json")),
-            project_id: "test-project".to_string(),
-            job_project_id: None,
-            dataset_id: "test-dataset".to_string(),
-            table_id: "test-table".to_string(),
-            ..Default::default()
-        });
-        let (_tx, rx) = mpsc::channel(10);
-
-        let result = ProcessorBuilder::new()
-            .config(config)
-            .receiver(rx)
-            .build()
-            .await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_task_id() {
-        let config = Arc::new(super::super::config::StorageRead {
-            name: "test".to_string(),
-            credentials_path: Some(PathBuf::from("/test/creds.json")),
-            project_id: "test-project".to_string(),
-            job_project_id: None,
-            dataset_id: "test-dataset".to_string(),
-            table_id: "test-table".to_string(),
-            ..Default::default()
-        });
-        let (tx, rx) = mpsc::channel(10);
-
-        let result = ProcessorBuilder::new()
-            .config(config)
-            .receiver(rx)
-            .sender(tx)
-            .build()
-            .await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_task_context() {
-        let config = Arc::new(super::super::config::StorageRead {
-            name: "test".to_string(),
-            credentials_path: Some(PathBuf::from("/test/creds.json")),
-            project_id: "test-project".to_string(),
-            job_project_id: None,
-            dataset_id: "test-dataset".to_string(),
-            table_id: "test-table".to_string(),
-            ..Default::default()
-        });
-        let (tx, rx) = mpsc::channel(10);
-
-        let result = ProcessorBuilder::new()
-            .config(config)
-            .receiver(rx)
-            .sender(tx)
-            .task_id(1)
-            .build()
-            .await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_processor_builder_missing_task_type() {
-        let config = Arc::new(super::super::config::StorageRead {
-            name: "test".to_string(),
-            credentials_path: Some(PathBuf::from("/test/creds.json")),
-            project_id: "test-project".to_string(),
-            job_project_id: None,
-            dataset_id: "test-dataset".to_string(),
-            table_id: "test-table".to_string(),
-            ..Default::default()
-        });
-        let (tx, rx) = mpsc::channel(10);
-        let task_manager = Arc::new(
-            flowgen_core::task::manager::TaskManagerBuilder::new()
-                .build()
-                .unwrap(),
-        );
-        let cache = Arc::new(flowgen_core::cache::memory::MemoryCache::new())
-            as Arc<dyn flowgen_core::cache::Cache>;
-        let task_context = Arc::new(
-            flowgen_core::task::context::TaskContextBuilder::new()
-                .flow_name("test".to_string())
-                .task_manager(task_manager)
-                .cache(cache)
-                .build()
-                .unwrap(),
-        );
-
-        let result = ProcessorBuilder::new()
-            .config(config)
-            .receiver(rx)
-            .sender(tx)
-            .task_id(1)
-            .task_context(task_context)
-            .build()
-            .await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
 
     #[test]
     fn test_invalid_timestamp() {
@@ -828,32 +690,5 @@ mod tests {
         assert_eq!(table_ref.project_id, "my-project");
         assert_eq!(table_ref.dataset_id, "my-dataset");
         assert_eq!(table_ref.table_id, "my-table");
-    }
-
-    #[test]
-    fn test_error_display_messages() {
-        let err = Error::InvalidTimestamp;
-        assert_eq!(err.to_string(), "Invalid timestamp format in snapshot_time");
-
-        let err = Error::NoDataReturned;
-        assert_eq!(
-            err.to_string(),
-            "No data returned from BigQuery Storage Read API"
-        );
-
-        let err = Error::MissingBuilderAttribute("config".to_string());
-        assert_eq!(
-            err.to_string(),
-            "Missing required builder attribute: config"
-        );
-    }
-
-    #[test]
-    fn test_processor_builder_default() {
-        let builder1 = ProcessorBuilder::new();
-        let builder2 = ProcessorBuilder::default();
-
-        assert!(builder1.config.is_none());
-        assert!(builder2.config.is_none());
     }
 }

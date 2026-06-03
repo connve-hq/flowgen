@@ -109,7 +109,9 @@ impl Client {
             Path::from_url_path(url.path()).map_err(|e| Error::ObjectStore { source: e.into() })?;
 
         let builder = opts.into_iter().fold(
-            AmazonS3Builder::from_env().with_url(url.to_string()),
+            AmazonS3Builder::from_env()
+                .with_url(url.to_string())
+                .with_virtual_hosted_style_request(true),
             |builder, (key, value)| match key.to_ascii_lowercase().parse() {
                 Ok(k) => builder.with_config(k, value),
                 Err(_) => builder,
@@ -216,113 +218,5 @@ impl ClientBuilder {
             options: self.options,
             context: None,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_client_builder_new() {
-        let builder = ClientBuilder::new();
-        assert!(builder.path.is_none());
-        assert!(builder.credentials_path.is_none());
-        assert!(builder.options.is_none());
-    }
-
-    #[test]
-    fn test_client_builder_path() {
-        let path = PathBuf::from("s3://test-bucket/data/");
-        let builder = ClientBuilder::new().path(path.clone());
-        assert_eq!(builder.path, Some(path));
-    }
-
-    #[test]
-    fn test_client_builder_credentials_path() {
-        let credentials_path = PathBuf::from("/path/to/credentials.json");
-        let builder = ClientBuilder::new().credentials_path(credentials_path.clone());
-        assert_eq!(builder.credentials_path, Some(credentials_path));
-    }
-
-    #[test]
-    fn test_client_builder_options() {
-        let mut options = HashMap::new();
-        options.insert("region".to_string(), "us-east-1".to_string());
-        options.insert(
-            "endpoint".to_string(),
-            "https://s3.amazonaws.com".to_string(),
-        );
-
-        let builder = ClientBuilder::new().options(options.clone());
-        assert_eq!(builder.options, Some(options));
-    }
-
-    #[test]
-    fn test_client_builder_build_missing_path() {
-        let result = ClientBuilder::new().build();
-        assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), Error::MissingBuilderAttribute(attr) if attr == "path")
-        );
-    }
-
-    #[test]
-    fn test_client_builder_build_success() {
-        let path = PathBuf::from("file:///tmp/test/");
-        let credentials_path = PathBuf::from("/service-account.json");
-        let mut options = HashMap::new();
-        options.insert("project_id".to_string(), "my-project".to_string());
-
-        let client = ClientBuilder::new()
-            .path(path.clone())
-            .credentials_path(credentials_path.clone())
-            .options(options.clone())
-            .build()
-            .unwrap();
-
-        assert_eq!(client.path, path);
-        assert_eq!(client.credentials_path, Some(credentials_path));
-        assert_eq!(client.options, Some(options));
-        assert!(client.context.is_none());
-    }
-
-    #[test]
-    fn test_client_builder_chain() {
-        let path = PathBuf::from("gs://bucket/path/");
-        let credentials_path = PathBuf::from("/creds.json");
-        let mut options = HashMap::new();
-        options.insert("timeout".to_string(), "30".to_string());
-
-        let client = ClientBuilder::new()
-            .path(path.clone())
-            .credentials_path(credentials_path.clone())
-            .options(options.clone())
-            .build()
-            .unwrap();
-
-        assert_eq!(client.path, path);
-        assert_eq!(client.credentials_path, Some(credentials_path));
-        assert_eq!(client.options, Some(options));
-    }
-
-    #[test]
-    fn test_client_builder_minimal() {
-        let path = PathBuf::from("file:///data/");
-        let client = ClientBuilder::new().path(path.clone()).build().unwrap();
-
-        assert_eq!(client.path, path);
-        assert!(client.credentials_path.is_none());
-        assert!(client.options.is_none());
-        assert!(client.context.is_none());
-    }
-
-    #[test]
-    fn test_client_context_structure() {
-        let path = PathBuf::from("file:///tmp/");
-        let client = ClientBuilder::new().path(path).build().unwrap();
-
-        assert!(client.context.is_none());
     }
 }

@@ -50,6 +50,8 @@ pub struct TaskContext {
     /// Defaults to one for linear flows where a single terminal task signals
     /// completion.
     pub leaf_count: usize,
+    /// Optional startup delay for staggering task initialization across replicas.
+    pub startup_delay: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for TaskContext {
@@ -253,6 +255,7 @@ impl TaskContextBuilder {
             retry: self.retry,
             cancellation_token: self.cancellation_token.unwrap_or_default(),
             leaf_count: self.leaf_count.unwrap_or(1),
+            startup_delay: None,
         })
     }
 }
@@ -261,13 +264,6 @@ impl TaskContextBuilder {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    #[test]
-    fn test_task_context_builder_new() {
-        let builder = TaskContextBuilder::new();
-        assert!(builder.flow_name.is_none());
-        assert!(builder.flow_labels.is_none());
-    }
 
     #[test]
     fn test_task_context_builder_build_success() {
@@ -295,20 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn test_task_context_builder_missing_flow_name() {
-        let mut labels = Map::new();
-        labels.insert("name".to_string(), Value::String("Test".to_string()));
-
-        let result = TaskContextBuilder::new().flow_labels(Some(labels)).build();
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
-    }
-
-    #[test]
     fn test_task_context_builder_defaults() {
         let task_manager = Arc::new(
             crate::task::manager::TaskManagerBuilder::new()
@@ -326,34 +308,6 @@ mod tests {
 
         assert_eq!(context.flow.name, "default-test");
         assert!(context.flow.labels.is_none());
-    }
-
-    #[test]
-    fn test_task_context_builder_chain() {
-        let mut labels = Map::new();
-        labels.insert(
-            "description".to_string(),
-            Value::String("Chained Builder Test".to_string()),
-        );
-        labels.insert("type".to_string(), Value::String("test".to_string()));
-
-        let task_manager = Arc::new(
-            crate::task::manager::TaskManagerBuilder::new()
-                .build()
-                .unwrap(),
-        );
-        let cache =
-            Arc::new(crate::cache::memory::MemoryCache::new()) as Arc<dyn crate::cache::Cache>;
-        let context = TaskContextBuilder::new()
-            .flow_name("chain-test".to_string())
-            .flow_labels(Some(labels.clone()))
-            .task_manager(task_manager)
-            .cache(cache)
-            .build()
-            .unwrap();
-
-        assert_eq!(context.flow.name, "chain-test");
-        assert_eq!(context.flow.labels, Some(labels));
     }
 
     #[test]

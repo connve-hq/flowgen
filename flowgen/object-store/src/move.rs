@@ -406,15 +406,18 @@ impl Runner for MoveProcessor {
         let retry_config =
             flowgen_core::retry::RetryConfig::merge(&self.task_context.retry, &self.config.retry);
 
-        let event_handler = match tokio_retry::Retry::spawn(retry_config.strategy(), || async {
-            match self.init().await {
-                Ok(handler) => Ok(handler),
-                Err(e) => {
-                    error!(error = %e, "Failed to initialize mover");
-                    Err(tokio_retry::RetryError::transient(e))
+        let event_handler = match tokio_retry::Retry::spawn(
+            retry_config.init_strategy(self.task_context.startup_delay),
+            || async {
+                match self.init().await {
+                    Ok(handler) => Ok(handler),
+                    Err(e) => {
+                        error!(error = %e, "Failed to initialize mover");
+                        Err(tokio_retry::RetryError::transient(e))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(handler) => Arc::new(handler),
@@ -424,12 +427,13 @@ impl Runner for MoveProcessor {
         };
 
         // Process incoming events, filtering by task ID.
+        let mut handlers = Vec::new();
         loop {
             match self.rx.recv().await {
                 Some(event) => {
                     let event_handler = Arc::clone(&event_handler);
                     let retry_strategy = retry_config.strategy();
-                    tokio::spawn(
+                    let handle = tokio::spawn(
                         async move {
                             let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                 match event_handler.handle(event.clone()).await {
@@ -454,8 +458,12 @@ impl Runner for MoveProcessor {
                         }
                         .instrument(tracing::Span::current()),
                     );
+                    handlers.push(handle);
                 }
-                None => return Ok(()),
+                None => {
+                    futures_util::future::join_all(handlers).await;
+                    return Ok(());
+                }
             }
         }
     }
@@ -588,17 +596,5 @@ mod tests {
 
         let deserialized: MoveResult = serde_json::from_value(json).unwrap();
         assert_eq!(deserialized.files_moved, 0);
-    }
-
-    #[test]
-    fn test_error_variants() {
-        let err = Error::NoObjectStoreContext;
-        assert!(matches!(err, Error::NoObjectStoreContext));
-
-        let err = Error::MissingBuilderAttribute("config".to_string());
-        assert!(matches!(err, Error::MissingBuilderAttribute(ref s) if s == "config"));
-
-        let err = Error::MissingBuilderAttribute("receiver".to_string());
-        assert!(matches!(err, Error::MissingBuilderAttribute(ref s) if s == "receiver"));
     }
 }

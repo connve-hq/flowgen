@@ -1,6 +1,8 @@
-//! Salesforce Tooling API processor.
+//! Salesforce SOAP API merge processor.
 //!
-//! Handles Tooling API operations such as creating managed event subscriptions.
+//! Merges duplicate SObject records (Account, Contact, Lead, Individual) into a
+//! single master record via the Salesforce SOAP API. Related records from the
+//! victim records are automatically reparented to the master.
 
 use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventBuilder, EventData, EventExt};
@@ -8,51 +10,52 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error, Instrument};
 
-/// Errors for Salesforce Tooling API operations.
+/// Errors for Salesforce SOAP API merge operations.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("Error sending event message: {source}")]
+    #[error("Failed to send event message to next task: {source}")]
     SendMessage {
         #[source]
         source: flowgen_core::event::Error,
     },
     #[error("Missing required builder attribute: {}", _0)]
     MissingBuilderAttribute(String),
-    #[error(transparent)]
-    SalesforceAuth(#[from] salesforce_core::client::Error),
-    #[error("Tooling API error: {source}")]
-    ToolingApi {
+    #[error("Salesforce authentication error: {source}")]
+    SalesforceAuth {
         #[source]
-        source: Box<salesforce_core::toolingapi::Error>,
+        source: salesforce_core::client::Error,
     },
-    #[error("Serialization error: {source}")]
-    SerdeExt {
+    #[error("Salesforce SOAP merge operation failed: {source}")]
+    MergeOperation {
         #[source]
-        source: flowgen_core::serde::Error,
+        source: salesforce_core::soapapi::MergeError,
     },
     #[error(transparent)]
     EventError(#[from] flowgen_core::event::Error),
-    #[error(transparent)]
-    ConfigRender(#[from] flowgen_core::config::Error),
+    #[error("Failed to render configuration template: {source}")]
+    ConfigRender {
+        #[source]
+        source: flowgen_core::config::Error,
+    },
     #[error("Task failed after all retry attempts: {source}")]
     RetryExhausted {
         #[source]
         source: Box<Error>,
     },
-    #[error("Operation requires full_name and metadata")]
-    MissingSubscriptionData,
-    #[error("Failed to build Tooling API client: {source}")]
-    ToolingClientBuild {
+    #[error("record_ids_to_merge must contain one or two IDs, got {count}")]
+    InvalidMergeCount { count: usize },
+    #[error("Failed to build SOAP API client: {source}")]
+    SoapClientBuild {
         #[source]
-        source: salesforce_core::toolingapi::Error,
+        source: salesforce_core::soapapi::ClientError,
     },
 }
 
-/// Event handler for processing individual Tooling API requests.
+/// Event handler for processing individual merge requests.
 pub struct EventHandler {
-    client: Arc<salesforce_core::toolingapi::Client>,
-    config: Arc<super::config::Tooling>,
+    client: Arc<salesforce_core::soapapi::Client>,
+    config: Arc<super::config::Merge>,
     tx: Option<Sender<Event>>,
     current_task_id: usize,
     sfdc_client: Arc<tokio::sync::Mutex<salesforce_core::client::Client>>,
@@ -67,103 +70,72 @@ impl EventHandler {
             return Ok(());
         }
 
-        // Run handler with event context for automatic meta preservation.
         let event = Arc::new(event);
         let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
 
         flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
             let event_value = serde_json::value::Value::try_from(event.as_ref())?;
-            let config = self.config.render(&event_value)?;
+            let config = self
+                .config
+                .render(&event_value)
+                .map_err(|e| Error::ConfigRender { source: e })?;
 
-            // Execute operation based on type.
-            match config.operation {
-                super::config::ToolingOperation::CreateManagedEventSubscription => {
-                    self.create_managed_event_subscription(&config, completion_tx_arc)
-                        .await?
+            let count = config.record_ids_to_merge.len();
+            if count == 0 || count > 2 {
+                return Err(Error::InvalidMergeCount { count });
+            }
+
+            let response = self
+                .client
+                .merge(
+                    &config.sobject_type,
+                    &config.master_record_id,
+                    &config.record_ids_to_merge,
+                    config.master_field_overrides.as_ref(),
+                    config.allow_duplicate_save,
+                )
+                .await
+                .map_err(|e| Error::MergeOperation { source: e })?;
+
+            let resp = serde_json::json!({
+                "success": response.success,
+                "merged_record_ids": response.merged_record_ids,
+                "updated_related_ids": response.updated_related_ids,
+            });
+
+            let mut e = EventBuilder::new()
+                .data(EventData::Json(resp))
+                .subject(config.name.to_owned())
+                .id(config.master_record_id.clone())
+                .task_id(self.current_task_id)
+                .task_type(self.task_type)
+                .build()?;
+
+            match self.tx {
+                Some(_) => {
+                    e.completion_tx = completion_tx_arc.clone();
+                }
+                None => {
+                    if let Some(arc) = completion_tx_arc.as_ref() {
+                        arc.signal_completion(e.data_as_json().ok());
+                    }
                 }
             }
+
+            e.send_with_logging(self.tx.as_ref())
+                .await
+                .map_err(|e| Error::SendMessage { source: e })?;
 
             Ok(())
         })
         .await
     }
-
-    /// Creates a managed event subscription using the Tooling API.
-    async fn create_managed_event_subscription(
-        &self,
-        config: &super::config::Tooling,
-        completion_tx_arc: Option<flowgen_core::event::SharedCompletionTx>,
-    ) -> Result<(), Error> {
-        let full_name = config
-            .full_name
-            .as_ref()
-            .ok_or(Error::MissingSubscriptionData)?;
-        let metadata = config
-            .metadata
-            .as_ref()
-            .ok_or(Error::MissingSubscriptionData)?;
-
-        // Build SDK request.
-        let request = salesforce_core::toolingapi::CreateManagedEventSubscriptionRequest {
-            full_name: full_name.clone(),
-            metadata: salesforce_core::toolingapi::ManagedEventSubscriptionMetadata {
-                label: metadata.label.clone(),
-                topic_name: metadata.topic_name.clone(),
-                default_replay: super::config::to_sdk_replay_preset(&metadata.default_replay),
-                state: super::config::to_sdk_subscription_state(&metadata.state),
-                error_recovery_replay: super::config::to_sdk_replay_preset(
-                    &metadata.error_recovery_replay,
-                ),
-            },
-        };
-
-        // Create subscription using SDK.
-        let response = self
-            .client
-            .create_managed_event_subscription(request)
-            .await
-            .map_err(|e| Error::ToolingApi {
-                source: Box::new(e),
-            })?;
-
-        // Serialize the response to JSON.
-        let resp = serde_json::to_value(&response).map_err(|e| Error::SerdeExt {
-            source: flowgen_core::serde::Error::Serde { source: e },
-        })?;
-
-        let mut e = EventBuilder::new()
-            .data(EventData::Json(resp))
-            .subject(config.name.to_owned())
-            .id(response.id.clone())
-            .task_id(self.current_task_id)
-            .task_type(self.task_type)
-            .build()?;
-
-        // Handle completion signal for the operation.
-        match self.tx {
-            Some(_) => {
-                e.completion_tx = completion_tx_arc.clone();
-            }
-            None => {
-                // Leaf task: signal completion.
-                if let Some(arc) = completion_tx_arc.as_ref() {
-                    arc.signal_completion(e.data_as_json().ok());
-                }
-            }
-        }
-
-        e.send_with_logging(self.tx.as_ref())
-            .await
-            .map_err(|e| Error::SendMessage { source: e })?;
-
-        Ok(())
-    }
 }
 
-/// Salesforce Tooling API processor.
+/// Salesforce SOAP API merge processor.
 #[derive(Debug)]
 pub struct Processor {
-    config: Arc<super::config::Tooling>,
+    config: Arc<super::config::Merge>,
     rx: Receiver<Event>,
     tx: Option<Sender<Event>>,
     task_id: usize,
@@ -177,23 +149,28 @@ impl flowgen_core::task::runner::Runner for Processor {
     type EventHandler = EventHandler;
 
     async fn init(&self) -> Result<EventHandler, Error> {
-        let init_config = self.config.render(&serde_json::json!({}))?;
+        let init_config = self
+            .config
+            .render(&serde_json::json!({}))
+            .map_err(|e| Error::ConfigRender { source: e })?;
 
         let sfdc_client = salesforce_core::client::Builder::new()
             .credentials_path(init_config.credentials_path.clone())
-            .build()?
-            .connect()
-            .await?;
-
-        let tooling_client = salesforce_core::toolingapi::ClientBuilder::new(sfdc_client.clone())
             .build()
-            .map_err(|e| Error::ToolingClientBuild { source: e })?;
+            .map_err(|e| Error::SalesforceAuth { source: e })?
+            .connect()
+            .await
+            .map_err(|e| Error::SalesforceAuth { source: e })?;
+
+        let soap_client = salesforce_core::soapapi::ClientBuilder::new(sfdc_client.clone())
+            .build()
+            .map_err(|e| Error::SoapClientBuild { source: e })?;
 
         let event_handler = EventHandler {
             config: Arc::clone(&self.config),
             current_task_id: self.task_id,
             tx: self.tx.clone(),
-            client: Arc::new(tooling_client),
+            client: Arc::new(soap_client),
             sfdc_client: Arc::new(tokio::sync::Mutex::new(sfdc_client)),
             task_type: self.task_type,
             task_context: Arc::clone(&self.task_context),
@@ -212,7 +189,7 @@ impl flowgen_core::task::runner::Runner for Processor {
                 match self.init().await {
                     Ok(handler) => Ok(handler),
                     Err(e) => {
-                        error!(error = %e, "Failed to initialize Tooling API processor");
+                        error!(error = %e, "Failed to initialize SOAP API merge processor.");
                         Err(tokio_retry::RetryError::transient(e))
                     }
                 }
@@ -240,12 +217,9 @@ impl flowgen_core::task::runner::Runner for Processor {
                                     match event_handler.handle(event_clone.clone()).await {
                                         Ok(result) => Ok(result),
                                         Err(e) => {
-                                            error!(error = %e, "Failed to process Tooling API operation");
-                                            let needs_reconnect = matches!(&e, Error::SalesforceAuth(_))
-                                                || matches!(&e,
-                                                    Error::ToolingApi { source }
-                                                        if matches!(source.as_ref(), salesforce_core::toolingapi::Error::Auth { .. })
-                                                );
+                                            error!(error = %e, "Failed to process SOAP merge operation.");
+                                            let needs_reconnect =
+                                                matches!(&e, Error::SalesforceAuth { .. });
 
                                             if needs_reconnect {
                                                 let mut sfdc_client =
@@ -253,10 +227,14 @@ impl flowgen_core::task::runner::Runner for Processor {
                                                 if let Err(reconnect_err) =
                                                     (*sfdc_client).reconnect().await
                                                 {
-                                                    error!(error = %reconnect_err, "Failed to reconnect");
-                                                    return Err(tokio_retry::RetryError::transient(Error::SalesforceAuth(
-                                                        reconnect_err,
-                                                    )));
+                                                    error!(error = %reconnect_err, "Failed to reconnect.");
+                                                    return Err(
+                                                        tokio_retry::RetryError::transient(
+                                                            Error::SalesforceAuth {
+                                                                source: reconnect_err,
+                                                            },
+                                                        ),
+                                                    );
                                                 }
                                             }
                                             Err(tokio_retry::RetryError::transient(e))
@@ -266,8 +244,7 @@ impl flowgen_core::task::runner::Runner for Processor {
                                 .await;
 
                                 if let Err(err) = result {
-                                    error!(error = %err, "Tooling API operation failed after all retry attempts");
-                                    // Emit error event downstream for error handling.
+                                    error!(error = %err, "SOAP merge operation failed after all retry attempts.");
                                     let mut error_event = event_clone.clone();
                                     error_event.error = Some(err.to_string());
                                     if let Some(ref tx) = event_handler.tx {
@@ -289,9 +266,9 @@ impl flowgen_core::task::runner::Runner for Processor {
     }
 }
 
-/// Builder for creating Processor instances.
+/// Builder for creating merge Processor instances.
 pub struct ProcessorBuilder {
-    config: Option<Arc<super::config::Tooling>>,
+    config: Option<Arc<super::config::Merge>>,
     rx: Option<Receiver<Event>>,
     tx: Option<Sender<Event>>,
     task_id: Option<usize>,
@@ -317,7 +294,7 @@ impl ProcessorBuilder {
         }
     }
 
-    pub fn config(mut self, config: Arc<super::config::Tooling>) -> Self {
+    pub fn config(mut self, config: Arc<super::config::Merge>) -> Self {
         self.config = Some(config);
         self
     }
@@ -359,7 +336,9 @@ impl ProcessorBuilder {
                 .rx
                 .ok_or_else(|| Error::MissingBuilderAttribute("receiver".to_string()))?,
             tx: self.tx,
-            task_id: self.task_id.unwrap_or(0),
+            task_id: self
+                .task_id
+                .ok_or_else(|| Error::MissingBuilderAttribute("task_id".to_string()))?,
             task_context: self
                 .task_context
                 .ok_or_else(|| Error::MissingBuilderAttribute("task_context".to_string()))?,
