@@ -146,6 +146,8 @@ pub enum TaskType {
     mongo_reader(flowgen_mongo::config::Reader),
     /// Mongo Reader task.
     mongo_writer(flowgen_mongo::config::Writer),
+    /// Mongo Change Stream task.
+    mongo_change_stream(flowgen_mongo::config::ChangeStream),
 }
 
 impl TaskType {
@@ -188,6 +190,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(_) => "braze_export_users_ids",
             TaskType::mongo_reader(_) => "mongo_reader",
             TaskType::mongo_writer(_) => "mongo_writer",
+            TaskType::mongo_change_stream(_) => "mongo_change_stream",
         }
     }
 
@@ -230,6 +233,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(c) => &c.name,
             TaskType::mongo_reader(c) => &c.name,
             TaskType::mongo_writer(c) => &c.name,
+            TaskType::mongo_change_stream(c) => &c.name,
         }
     }
 
@@ -284,6 +288,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(c) => c.depends_on.as_ref(),
             TaskType::mongo_reader(c) => c.depends_on.as_ref(),
             TaskType::mongo_writer(c) => c.depends_on.as_ref(),
+            TaskType::mongo_change_stream(c) => c.depends_on.as_ref(),
         }
     }
 }
