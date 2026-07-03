@@ -34,7 +34,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::error;
 
 /// Default port for the AI gateway server.
 pub const DEFAULT_AI_GATEWAY_PORT: u16 = 3002;
@@ -93,6 +93,26 @@ impl HasFlowName for LlmProxyRegistration {
     }
 }
 
+/// Default AI gateway request body limit. Sized for 1 M-token
+/// prompts with tool schemas and multi-turn histories.
+pub const DEFAULT_AI_GATEWAY_MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+
+/// Worker-level dispatcher tuning knobs. Kept small so the framework
+/// contract stays generic.
+#[derive(Clone, Debug)]
+pub struct AiGatewayExtras {
+    /// Maximum inbound request body size, in bytes.
+    pub max_body_bytes: usize,
+}
+
+impl Default for AiGatewayExtras {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_AI_GATEWAY_MAX_BODY_BYTES,
+        }
+    }
+}
+
 /// Dispatcher for AI gateway traffic.
 ///
 /// Wires `POST <path>/chat/completions` and `GET <path>/models` and routes
@@ -101,15 +121,17 @@ pub struct AiGatewayDispatcher;
 
 impl Dispatcher for AiGatewayDispatcher {
     type Registration = LlmProxyRegistration;
-    type Extras = ();
+    type Extras = AiGatewayExtras;
 
     fn build_router(state: DispatchState<Self::Registration, Self::Extras>) -> Router {
         let prefix = state.path.trim_end_matches('/').to_string();
         let chat_route = format!("{prefix}/chat/completions");
         let models_route = format!("{prefix}/models");
+        let body_limit = state.extras.max_body_bytes;
         Router::new()
             .route(&chat_route, post(dispatch_chat_completions))
             .route(&models_route, get(list_models))
+            .layer(axum::extract::DefaultBodyLimit::max(body_limit))
             .with_state(state)
     }
 }
@@ -135,7 +157,9 @@ struct ModelEntry {
 
 /// Returns the list of currently-registered gateway names in the OpenAI
 /// models schema.
-async fn list_models(State(state): State<DispatchState<LlmProxyRegistration>>) -> Response {
+async fn list_models(
+    State(state): State<DispatchState<LlmProxyRegistration, AiGatewayExtras>>,
+) -> Response {
     let created = chrono::Utc::now().timestamp();
     let data = state
         .table
@@ -158,7 +182,7 @@ async fn list_models(State(state): State<DispatchState<LlmProxyRegistration>>) -
 /// registration, splits on the first `/`, and dispatches to the matching
 /// gateway with the downstream-model portion of `model`.
 async fn dispatch_chat_completions(
-    State(state): State<DispatchState<LlmProxyRegistration>>,
+    State(state): State<DispatchState<LlmProxyRegistration, AiGatewayExtras>>,
     headers: HeaderMap,
     axum::Json(request): axum::Json<ChatCompletionRequest>,
 ) -> Response {
@@ -205,13 +229,16 @@ async fn dispatch_chat_completions(
         .messages
         .iter()
         .find(|m| m.is_system())
-        .map(|m| m.content.clone());
+        .and_then(|m| m.content.clone());
 
     let user_messages: Vec<&Message> = request.messages.iter().filter(|m| !m.is_system()).collect();
 
+    // Skip messages without textual content (assistant tool-call
+    // messages, tool-role replies) when synthesising the flat prompt
+    // string that non-passthrough flows expect.
     let prompt = user_messages
         .iter()
-        .map(|m| m.content.as_str())
+        .filter_map(|m| m.content.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -219,14 +246,38 @@ async fn dispatch_chat_completions(
     let created = chrono::Utc::now().timestamp();
     let is_stream = request.stream;
 
-    let data = serde_json::json!({
-        "prompt": prompt,
-        "system_prompt": system_prompt,
-        "model": downstream_model,
-        "temperature": request.temperature,
-        "max_tokens": request.max_tokens,
-        "stream": is_stream,
-    });
+    // Attach the full OpenAI-shape payload only when the client
+    // actually sent `tools`. Pumping the raw message list into
+    // event.data on every request pushes flows over the Rhai
+    // template renderer's expression-size limit.
+    let client_sent_tools = matches!(&request.tools, Some(t) if !t.is_empty());
+    let payload = crate::ai_gateway::config::EventPayload {
+        prompt: &prompt,
+        system_prompt: system_prompt.as_deref(),
+        model: &downstream_model,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+        stream: is_stream,
+        messages: match client_sent_tools {
+            true => Some(request.messages.as_slice()),
+            false => None,
+        },
+        tools: match (client_sent_tools, request.tools.as_deref()) {
+            (true, Some(t)) => Some(t),
+            _ => None,
+        },
+        tool_choice: match client_sent_tools {
+            true => request.tool_choice.as_ref(),
+            false => None,
+        },
+    };
+    let data = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "Failed to serialize AI gateway event payload");
+            return DispatchError::PayloadSerialization { source: e }.into_response();
+        }
+    };
 
     let mut meta = serde_json::Map::new();
     if let Some(ref ctx) = user_context {
@@ -394,11 +445,30 @@ async fn dispatch_blocking(
         message: e.to_string(),
     })?;
 
-    let content = completion_data
-        .and_then(|v| v.get("content").and_then(|c| c.as_str()).map(String::from))
-        .unwrap_or_default();
+    // Downstream serialises `CompletionResponse` — read `text` for the
+    // completion string and `tool_calls` for passthrough. Fall back to
+    // `content` for legacy leaf tasks that emit their own shape.
+    let text = match completion_data.as_ref() {
+        Some(v) => match v.get("text").or_else(|| v.get("content")) {
+            Some(c) => match c.as_str() {
+                Some(s) => s.to_string(),
+                None => String::new(),
+            },
+            None => String::new(),
+        },
+        None => String::new(),
+    };
+    let tool_calls: Vec<crate::ai_gateway::config::ToolCall> =
+        match completion_data.as_ref().and_then(|v| v.get("tool_calls")) {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .map_err(|source| DispatchError::MalformedToolCalls { source })?,
+            _ => Vec::new(),
+        };
 
-    let response = ChatCompletionResponse::new(request_id, created, model, content);
+    let response = match tool_calls.is_empty() {
+        true => ChatCompletionResponse::new(request_id, created, model, text),
+        false => ChatCompletionResponse::with_tool_calls(request_id, created, model, tool_calls),
+    };
     Ok(axum::Json(response).into_response())
 }
 
@@ -448,12 +518,6 @@ async fn dispatch_streaming(
     e.send_with_logging(Some(&registration.tx))
         .await
         .map_err(|source| DispatchError::SendMessage { source })?;
-
-    info!(
-        gateway = %registration.config.name,
-        correlation_id = %correlation_id,
-        "Streaming AI gateway request accepted"
-    );
 
     let registry = Arc::clone(&registration.response_registry);
     let cid = correlation_id.clone();
@@ -534,16 +598,53 @@ async fn dispatch_streaming(
             }
         };
 
+        let mut emitted_tool_calls = false;
         match &result {
             Some(Ok(Ok(Some(data)))) => {
-                if let Some(content) = data.get("content").and_then(|c| c.as_str()) {
-                    let chunk = ChatCompletionChunk::content(
+                // Legacy shape uses `content`; `CompletionChunk` uses
+                // `text`. Read either so old and new emitters coexist.
+                let text = match data.get("text").or_else(|| data.get("content")) {
+                    Some(c) => match c.as_str() {
+                        Some(s) => s.to_string(),
+                        None => String::new(),
+                    },
+                    None => String::new(),
+                };
+                if !text.is_empty() {
+                    let chunk = ChatCompletionChunk::content(&request_id, created, &model, text);
+                    send_sse(&sse_tx, &chunk).await;
+                }
+                let tool_calls: Vec<crate::ai_gateway::config::ToolCall> =
+                    match data.get("tool_calls") {
+                        Some(v) if !v.is_null() => match serde_json::from_value(v.clone()) {
+                            Ok(list) => list,
+                            Err(e) => {
+                                error!(error = %e, "Malformed tool_calls in downstream event");
+                                Vec::new()
+                            }
+                        },
+                        _ => Vec::new(),
+                    };
+                for (idx, call) in tool_calls.into_iter().enumerate() {
+                    emitted_tool_calls = true;
+                    let idx = idx as u32;
+                    let open = ChatCompletionChunk::tool_call_open(
                         &request_id,
                         created,
                         &model,
-                        content.to_string(),
+                        idx,
+                        call.id.clone(),
+                        call.function.name.clone(),
                     );
-                    send_sse(&sse_tx, &chunk).await;
+                    send_sse(&sse_tx, &open).await;
+                    let args = ChatCompletionChunk::tool_call_arguments(
+                        &request_id,
+                        created,
+                        &model,
+                        idx,
+                        call.function.arguments.clone(),
+                    );
+                    send_sse(&sse_tx, &args).await;
                 }
             }
             Some(Ok(Err(e))) => {
@@ -561,11 +662,11 @@ async fn dispatch_streaming(
             _ => {}
         }
 
-        send_sse(
-            &sse_tx,
-            &ChatCompletionChunk::stop(&request_id, created, &model),
-        )
-        .await;
+        let final_chunk = match emitted_tool_calls {
+            true => ChatCompletionChunk::stop_tool_calls(&request_id, created, &model),
+            false => ChatCompletionChunk::stop(&request_id, created, &model),
+        };
+        send_sse(&sse_tx, &final_chunk).await;
         let _ = sse_tx.send(Ok(SSE_DONE.to_string())).await;
     });
 
@@ -618,6 +719,16 @@ enum DispatchError {
     FlowCompletionFailed,
     #[error("Flow error: {message}")]
     FlowError { message: String },
+    #[error("Downstream tool_calls payload is malformed: {source}")]
+    MalformedToolCalls {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Failed to serialize gateway event payload: {source}")]
+    PayloadSerialization {
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// OpenAI-compatible error response body.
@@ -651,7 +762,9 @@ impl DispatchError {
             DispatchError::EventBuilder { .. }
             | DispatchError::SendMessage { .. }
             | DispatchError::FlowCompletionFailed
-            | DispatchError::FlowError { .. } => "server_error",
+            | DispatchError::FlowError { .. }
+            | DispatchError::MalformedToolCalls { .. }
+            | DispatchError::PayloadSerialization { .. } => "server_error",
         }
     }
 }
@@ -671,7 +784,9 @@ impl IntoResponse for DispatchError {
             | DispatchError::AuthProviderMissing => StatusCode::UNAUTHORIZED,
             DispatchError::EventBuilder { .. }
             | DispatchError::SendMessage { .. }
-            | DispatchError::FlowCompletionFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            | DispatchError::FlowCompletionFailed
+            | DispatchError::MalformedToolCalls { .. }
+            | DispatchError::PayloadSerialization { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             DispatchError::FlowError { .. } => StatusCode::BAD_GATEWAY,
         };
         let body = OpenAiErrorResponse {

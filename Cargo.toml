@@ -13,7 +13,7 @@ exclude = [".cargo"]
 allow_attributes = "deny"
 
 [workspace.package]
-version = "0.120.1"
+version = "0.121.0"
 authors = ["CONNVE"]
 license = "MPL-2.0"
 edition = "2021"
@@ -63,6 +63,7 @@ reqwest = { version = "0.13.1", default-features = false, features = [
     "brotli",
     "deflate",
     "charset",
+    "stream",
 ] }
 url = { version = "2.5" }
 # gitoxide — pure-Rust git implementation. HTTPS transport via reqwest with
@@ -98,6 +99,7 @@ regex = { version = "1.12" }
 uuid = { version = "1", features = ["v7"] }
 axum = { version = "0.8" }
 base64 = { version = "0.22" }
+http = { version = "1.4" }
 bb8 = { version = "0.9" }
 bb8-tiberius = { version = "0.16" }
 async-trait = { version = "0.1" }

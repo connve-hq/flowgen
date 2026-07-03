@@ -547,15 +547,19 @@ impl App {
             .map(|mcp| mcp.enabled)
             .unwrap_or(false);
 
-        let has_mcp_tools = flow_configs.iter().any(|fc| {
-            fc.flow
-                .tasks
-                .iter()
-                .any(|t| matches!(t, crate::config::TaskType::mcp_tool(_)))
+        let has_mcp_tasks = flow_configs.iter().any(|fc| {
+            fc.flow.tasks.iter().any(|t| {
+                matches!(
+                    t,
+                    crate::config::TaskType::mcp_tool(_)
+                        | crate::config::TaskType::mcp_resource(_)
+                        | crate::config::TaskType::mcp_prompt(_)
+                )
+            })
         });
 
-        if has_mcp_tools && !mcp_enabled {
-            warn!("Flows contain mcp_tool tasks but mcp_server is not enabled in config, MCP tools will not be registered");
+        if has_mcp_tasks && !mcp_enabled {
+            warn!("Flows contain MCP registration tasks but mcp_server is not enabled in config; registrations will be skipped");
         }
 
         let mcp_server: Option<Arc<flowgen_mcp::server::McpServer>> = if mcp_enabled {
@@ -592,6 +596,9 @@ impl App {
             let path = mcp_config
                 .map(|c| c.path.clone())
                 .unwrap_or_else(|| flowgen_mcp::server::DEFAULT_MCP_PATH.to_string());
+            let resource_uri_scheme = mcp_config
+                .map(|c| c.resource_uri_scheme.clone())
+                .unwrap_or_else(|| "flowgen".to_string());
             let auth_provider = match mcp_config.and_then(|c| c.auth.clone()) {
                 Some(auth_config) => Some(
                     auth_config
@@ -605,6 +612,7 @@ impl App {
                 path,
                 credentials,
                 auth_provider,
+                resource_uri_scheme,
             )))
         } else {
             None
@@ -647,9 +655,15 @@ impl App {
                     ),
                     None => None,
                 };
+                let extras = match ai_config {
+                    Some(c) => flowgen_ai_agent::ai_gateway::server::AiGatewayExtras {
+                        max_body_bytes: c.max_body_bytes,
+                    },
+                    None => flowgen_ai_agent::ai_gateway::server::AiGatewayExtras::default(),
+                };
                 let server = flowgen_core::http_server::HttpServer::<
                     flowgen_ai_agent::ai_gateway::server::AiGatewayDispatcher,
-                >::new(path)
+                >::new_with_extras(path, extras)
                 .with_credentials_path(credentials_path)
                 .with_auth_provider(auth_provider);
                 Some(Arc::new(server))

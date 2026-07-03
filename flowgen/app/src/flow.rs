@@ -163,6 +163,12 @@ pub enum Error {
     /// Error in MCP tool processor task.
     #[error(transparent)]
     McpToolProcessor(#[from] flowgen_mcp::processor::Error),
+    /// Error in MCP resource processor task.
+    #[error(transparent)]
+    McpResourceProcessor(#[from] flowgen_mcp::resource::processor::Error),
+    /// Error in MCP prompt processor task.
+    #[error(transparent)]
+    McpPromptProcessor(#[from] flowgen_mcp::prompt::processor::Error),
     /// Error in NATS KV store task.
     #[error(transparent)]
     NatsKvStore(#[from] flowgen_nats::jetstream::kv_store::Error),
@@ -188,7 +194,7 @@ pub enum Error {
     #[error("Flow cannot be initialized as http_server is not enabled")]
     HttpServerNotEnabled,
     /// Flow cannot be initialized because MCP server is not enabled.
-    #[error("Flow cannot be initialized as mcp_server is not configured. Add worker.mcp_server to config or remove mcp_tool tasks.")]
+    #[error("Flow cannot be initialized as mcp_server is not configured. Add worker.mcp_server to config or remove mcp_tool/mcp_resource/mcp_prompt tasks.")]
     McpServerNotEnabled,
     /// Flow cannot be initialized because AI gateway server is not enabled.
     #[error("Flow cannot be initialized as ai_gateway is not configured. Add worker.ai_gateway to config or remove llm_proxy tasks.")]
@@ -285,7 +291,12 @@ impl TaskRegistryBuilder {
             return Ok(TaskRegistry { tasks: Vec::new() });
         }
 
-        if tasks_config.iter().any(|t| t.depends_on().is_some()) {
+        // The DAG path also owns the implicit-parent walk that skips
+        // registration-only tasks, so route through it whenever any task
+        // opts out of pipeline I/O even if none declares `depends_on`.
+        let needs_dag = tasks_config.iter().any(|t| t.depends_on().is_some())
+            || tasks_config.iter().any(|t| !t.has_pipeline_io());
+        if needs_dag {
             self.build_dag(tasks_config)
         } else {
             self.build_linear(tasks_config)
@@ -303,10 +314,14 @@ impl TaskRegistryBuilder {
         let mut task_descriptors = Vec::with_capacity(task_count);
 
         for (idx, task_type) in tasks_config.iter().enumerate() {
-            // Determine blocking status (webhooks and mcp_tool tasks are blocking).
+            // Blocking setup tasks (webhooks, MCP registrations, LLM proxy).
             let is_blocking = matches!(
                 task_type,
-                TaskType::http_endpoint(_) | TaskType::mcp_tool(_) | TaskType::llm_proxy(_)
+                TaskType::http_endpoint(_)
+                    | TaskType::mcp_tool(_)
+                    | TaskType::mcp_resource(_)
+                    | TaskType::mcp_prompt(_)
+                    | TaskType::llm_proxy(_)
             );
 
             let input_rx = if idx > 0 {
@@ -344,8 +359,13 @@ impl TaskRegistryBuilder {
     ///
     /// Tasks without `depends_on` fall back to depending on the previous task
     /// in the list, so mixed flows (some tasks with `depends_on`, some without)
-    /// work intuitively. Fan-out points (multiple tasks depending on the same
-    /// parent) use a dispatcher that clones events to each child channel.
+    /// work intuitively. Registration-only tasks (`has_pipeline_io() == false`)
+    /// are skipped when resolving the implicit parent and never get an
+    /// implicit parent themselves — they neither emit nor consume events, so
+    /// wiring them into the DAG would either stall a downstream task on a
+    /// channel that never sends or attach them to a channel they will never
+    /// read. Fan-out points (multiple tasks depending on the same parent)
+    /// use a dispatcher that clones events to each child channel.
     fn build_dag(&self, tasks_config: &[TaskType]) -> Result<TaskRegistry, Error> {
         let task_count = tasks_config.len();
 
@@ -362,6 +382,10 @@ impl TaskRegistryBuilder {
         }
 
         // Resolve each task's parent indices from `depends_on` names.
+        // Registration-only tasks never get an implicit parent, and the
+        // implicit-parent walk skips over any earlier registration-only task
+        // so a normal task following one still chains to the last real
+        // pipeline task.
         let mut parent_indices: Vec<Vec<usize>> = Vec::with_capacity(task_count);
         for (idx, task_type) in tasks_config.iter().enumerate() {
             let parents = match task_type.depends_on() {
@@ -384,8 +408,12 @@ impl TaskRegistryBuilder {
                     }
                     indices
                 }
-                None if idx > 0 => vec![idx - 1],
-                None => vec![],
+                None if !task_type.has_pipeline_io() => vec![],
+                None => (0..idx)
+                    .rev()
+                    .find(|&i| tasks_config[i].has_pipeline_io())
+                    .map(|i| vec![i])
+                    .unwrap_or_default(),
             };
             parent_indices.push(parents);
         }
@@ -495,7 +523,11 @@ impl TaskRegistryBuilder {
         for (idx, task_type) in tasks_config.iter().enumerate() {
             let is_blocking = matches!(
                 task_type,
-                TaskType::http_endpoint(_) | TaskType::mcp_tool(_) | TaskType::llm_proxy(_)
+                TaskType::http_endpoint(_)
+                    | TaskType::mcp_tool(_)
+                    | TaskType::mcp_resource(_)
+                    | TaskType::mcp_prompt(_)
+                    | TaskType::llm_proxy(_)
             );
             task_descriptors.push(TaskDescriptor {
                 id: idx,
@@ -582,14 +614,18 @@ impl Flow {
         let has_blocking_tasks = self.config.flow.tasks.iter().any(|task| {
             matches!(
                 task,
-                TaskType::http_endpoint(_) | TaskType::mcp_tool(_) | TaskType::llm_proxy(_)
+                TaskType::http_endpoint(_)
+                    | TaskType::mcp_tool(_)
+                    | TaskType::mcp_resource(_)
+                    | TaskType::mcp_prompt(_)
+                    | TaskType::llm_proxy(_)
             )
         });
 
         if has_blocking_tasks {
             if self.config.flow.require_leader_election.unwrap_or(false) {
                 info!(
-                    "Flow {} contains a blocking task (webhook, mcp_tool, or llm_proxy); `required_leader_election` flag will be ignored.",
+                    "Flow {} contains a blocking task (webhook, MCP registration, or llm_proxy); `required_leader_election` flag will be ignored.",
                     self.config.flow.name
                 );
             }
@@ -619,13 +655,13 @@ impl Flow {
             return Err(Error::HttpServerNotEnabled);
         }
 
-        // Validate: Flow with mcp_tool tasks requires MCP server to be configured.
-        let has_mcp_tasks = self
-            .config
-            .flow
-            .tasks
-            .iter()
-            .any(|task| matches!(task, TaskType::mcp_tool(_)));
+        // Validate: any MCP registration task requires the MCP server.
+        let has_mcp_tasks = self.config.flow.tasks.iter().any(|task| {
+            matches!(
+                task,
+                TaskType::mcp_tool(_) | TaskType::mcp_resource(_) | TaskType::mcp_prompt(_)
+            )
+        });
 
         if has_mcp_tasks && self.mcp_server.is_none() {
             return Err(Error::McpServerNotEnabled);
@@ -1760,6 +1796,44 @@ async fn spawn_task(
                 .instrument(span),
             )
         }
+        TaskType::mcp_resource(config) => {
+            let config = Arc::new(config);
+            let mcp_server = mcp_server.clone().ok_or(Error::McpServerNotEnabled)?;
+            // mcp_resource emits no events; drop the pipeline sender.
+            drop(tx);
+            tokio::spawn(
+                async move {
+                    let builder = flowgen_mcp::resource::processor::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context)
+                        .mcp_server(mcp_server);
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
+        TaskType::mcp_prompt(config) => {
+            let config = Arc::new(config);
+            let mcp_server = mcp_server.clone().ok_or(Error::McpServerNotEnabled)?;
+            // mcp_prompt emits no events; drop the pipeline sender.
+            drop(tx);
+            tokio::spawn(
+                async move {
+                    let builder = flowgen_mcp::prompt::processor::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context)
+                        .mcp_server(mcp_server);
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
         TaskType::llm_proxy(config) => {
             let config = Arc::new(config);
             let ai_gateway_server = ai_gateway_server
@@ -2483,5 +2557,116 @@ mod tests {
                 task.task_type.name()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_registration_only_tasks_get_no_implicit_parent() {
+        use crate::config::{Flow, FlowConfig, TaskType};
+
+        let mcp_prompt = |name: &str| {
+            TaskType::mcp_prompt(flowgen_mcp::prompt::config::Processor {
+                name: name.to_string(),
+                description: format!("desc for {name}"),
+                arguments: Vec::new(),
+                template: Some(flowgen_core::resource::Source::Inline("body".to_string())),
+                messages: None,
+                depends_on: None,
+                retry: None,
+            })
+        };
+
+        // Two mcp_prompts back-to-back without any `depends_on:` — both
+        // should register as independent sources, neither should inherit
+        // the other as a parent.
+        let flow_config = Arc::new(FlowConfig {
+            flow: Flow {
+                name: "registration_only".to_string(),
+                labels: None,
+                tasks: vec![mcp_prompt("a"), mcp_prompt("b")],
+                require_leader_election: None,
+                parallel_instances: 1,
+            },
+        });
+
+        let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
+
+        for task in &registry.tasks {
+            assert!(
+                task.input_rx.is_none(),
+                "{} must have no inbound channel",
+                task.task_type.name()
+            );
+            assert!(
+                task.output_tx.is_none(),
+                "{} must have no outbound channel",
+                task.task_type.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_implicit_parent_skips_registration_only() {
+        use crate::config::{Flow, FlowConfig, TaskType};
+
+        let script = |name: &str| {
+            TaskType::script(flowgen_core::task::script::config::Processor {
+                name: name.to_string(),
+                depends_on: None,
+                ..Default::default()
+            })
+        };
+        let mcp_prompt = |name: &str| {
+            TaskType::mcp_prompt(flowgen_mcp::prompt::config::Processor {
+                name: name.to_string(),
+                description: format!("desc for {name}"),
+                arguments: Vec::new(),
+                template: Some(flowgen_core::resource::Source::Inline("body".to_string())),
+                messages: None,
+                depends_on: None,
+                retry: None,
+            })
+        };
+
+        // script → mcp_prompt → script: the trailing script should chain
+        // back to the first script through the mcp_prompt, not treat the
+        // prompt as its parent.
+        let flow_config = Arc::new(FlowConfig {
+            flow: Flow {
+                name: "skip_registration".to_string(),
+                labels: None,
+                tasks: vec![script("first"), mcp_prompt("register"), script("last")],
+                require_leader_election: None,
+                parallel_instances: 1,
+            },
+        });
+
+        let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
+
+        let prompt = registry
+            .tasks
+            .iter()
+            .find(|t| t.task_type.name() == "register")
+            .expect("prompt missing");
+        assert!(prompt.input_rx.is_none(), "prompt has no inbound channel");
+        assert!(prompt.output_tx.is_none(), "prompt has no outbound channel");
+
+        let first = registry
+            .tasks
+            .iter()
+            .find(|t| t.task_type.name() == "first")
+            .expect("first missing");
+        let last = registry
+            .tasks
+            .iter()
+            .find(|t| t.task_type.name() == "last")
+            .expect("last missing");
+        assert!(
+            first.output_tx.is_some(),
+            "first still emits — its child is `last`, not `register`"
+        );
+        assert!(
+            last.input_rx.is_some(),
+            "last consumes — its parent is `first`, walked past `register`"
+        );
     }
 }

@@ -1767,7 +1767,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "arrow",
  "atty",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_ai_agent"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
@@ -1815,6 +1815,7 @@ dependencies = [
  "flowgen_core",
  "futures-util",
  "handlebars",
+ "http",
  "humantime-serde",
  "rig-core",
  "rig-vertexai",
@@ -1833,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_core"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -1842,6 +1843,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "axum 0.8.8",
+ "base64",
  "bincode",
  "bytes",
  "chrono",
@@ -1879,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_gcp"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -1907,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_git"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "async-trait",
  "flowgen_core",
@@ -1924,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_html"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "async-trait",
  "flowgen_core",
@@ -1940,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_http"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "arrow-json",
  "async-trait",
@@ -1966,11 +1968,12 @@ dependencies = [
 
 [[package]]
 name = "flowgen_mcp"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "async-trait",
  "axum 0.8.8",
  "base64",
+ "bytes",
  "dashmap",
  "flowgen_core",
  "futures-util",
@@ -1978,12 +1981,14 @@ dependencies = [
  "http-body-util",
  "humantime",
  "humantime-serde",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-retry2",
  "tokio-stream",
+ "tokio-util",
  "tower 0.5.3",
  "tracing",
  "uuid",
@@ -1991,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_mssql"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2014,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_nats"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "arrow",
  "async-nats",
@@ -2041,7 +2046,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_object_store"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2064,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_oci"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2084,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_salesforce"
-version = "0.120.1"
+version = "0.121.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -5680,9 +5685,9 @@ checksum = "5a651516ddc9168ebd67b24afd085a718be02f8858fe406591b013d101ce2f40"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.2"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "958f21e8e7ceb5a1aa7fa87fab28e7c75976e0bfe7e23ff069e0a260f894067d"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
  "serde",

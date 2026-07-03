@@ -81,10 +81,31 @@ pub enum Error {
     },
     #[error("Failed to connect to MCP server at {url}: {reason}")]
     McpConnection { url: String, reason: String },
+    #[error("Invalid Authorization header for MCP server at {url}: {source}")]
+    McpAuthHeader {
+        url: String,
+        #[source]
+        source: http::header::InvalidHeaderValue,
+    },
     #[error(
         "Client registry type mismatch — same provider/model/credentials key used with incompatible client types"
     )]
     ClientRegistryMismatch,
+    #[error("Event data error: {source}")]
+    Event {
+        #[source]
+        source: flowgen_core::event::Error,
+    },
+    #[error("Failed to deserialize passthrough payload from event data: {source}")]
+    PassthroughDeserialize {
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("Failed to build passthrough request: {source}")]
+    PassthroughBuild {
+        #[source]
+        source: super::passthrough::Error,
+    },
 }
 
 /// Response structure for completion events.
@@ -99,6 +120,11 @@ pub struct CompletionResponse {
     /// Optional usage statistics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<CompletionUsage>,
+    /// Tool invocations returned by the model. Populated only on
+    /// tool-passthrough responses; the client is expected to execute
+    /// each call and reply with a tool-role follow-up.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::ai_gateway::config::ToolCall>,
 }
 
 /// Streaming chunk for completion events.
@@ -110,17 +136,51 @@ pub struct CompletionChunk {
     pub is_final: bool,
     /// Index of this chunk in the sequence.
     pub index: usize,
+    /// Complete tool calls carried in this chunk. Populated only on
+    /// passthrough streams; the gateway emits one open/arguments
+    /// delta pair per call and switches the final chunk's
+    /// finish_reason to `tool_calls`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<crate::ai_gateway::config::ToolCall>,
+    /// Reasoning text; when set, `text` is empty on that chunk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Token usage statistics for completions.
+///
+/// Fields carry OpenAI wire names for a straight forward through
+/// `ai_gateway::config::Usage` to the gateway response. `total_tokens`
+/// may be greater than `prompt_tokens + completion_tokens` because
+/// some providers count cached-input separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionUsage {
     /// Number of tokens in the prompt.
-    pub prompt_tokens: usize,
+    pub prompt_tokens: u64,
     /// Number of tokens in the completion.
-    pub completion_tokens: usize,
+    pub completion_tokens: u64,
     /// Total tokens used.
-    pub total_tokens: usize,
+    pub total_tokens: u64,
+}
+
+impl From<rig::completion::Usage> for CompletionUsage {
+    fn from(u: rig::completion::Usage) -> Self {
+        Self {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.total_tokens,
+        }
+    }
+}
+
+impl From<CompletionUsage> for crate::ai_gateway::config::Usage {
+    fn from(u: CompletionUsage) -> Self {
+        Self {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        }
+    }
 }
 
 /// API credentials for AI providers.
@@ -206,6 +266,15 @@ async fn build_agent_client(
 
     if let Some(handle) = tool_server_handle {
         builder = builder.tool_server_handle(handle);
+    }
+
+    if let Some(thinking) = &config.thinking {
+        let params = thinking
+            .to_additional_params(&config.provider)
+            .map_err(|source| Error::SerdeJson { source })?;
+        if let Some(params) = params {
+            builder = builder.additional_params(params);
+        }
     }
 
     builder
@@ -332,21 +401,245 @@ impl EventHandler {
         flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
             let (rendered_prompt, rendered_system_prompt) = self.render_prompts(&event).await?;
 
-            let completion_text = client
+            // Tool-use passthrough path: forward client-supplied tools to
+            // the provider without running rig's agent loop, then surface
+            // whatever tool_calls the model returns.
+            if self.should_passthrough(&event)? {
+                let response = self
+                    .passthrough_response(&client, &event, rendered_system_prompt)
+                    .await?;
+                return self.send_response(response, completion_tx_arc).await;
+            }
+
+            let completion = client
                 .complete(&rendered_prompt, rendered_system_prompt.as_deref())
                 .await
                 .map_err(|source| Error::AgentClient { source })?;
 
             let response = CompletionResponse {
-                text: completion_text,
+                text: completion.text,
                 model: self.config.model.clone(),
                 provider: format!("{:?}", self.config.provider),
-                usage: None,
+                usage: Some(completion.usage.into()),
+                tool_calls: Vec::new(),
             };
 
             self.send_response(response, completion_tx_arc).await
         })
         .await
+    }
+
+    /// Returns true when the caller opted into passthrough and the event
+    /// actually carries client-supplied tool definitions.
+    fn should_passthrough(&self, event: &Arc<Event>) -> Result<bool, Error> {
+        if !self.config.tool_passthrough {
+            return Ok(false);
+        }
+        let data = event
+            .data_as_json()
+            .map_err(|source| Error::Event { source })?;
+        let has_tools = match data.get("tools").and_then(|v| v.as_array()) {
+            Some(arr) => !arr.is_empty(),
+            None => false,
+        };
+        Ok(has_tools)
+    }
+
+    /// Passthrough dispatch: convert OpenAI-shape event data into a rig
+    /// `CompletionRequest`, delegate to the client, and package the
+    /// response back into the flowgen event contract.
+    async fn passthrough_response(
+        &self,
+        client: &crate::agent::AgentClient,
+        event: &Arc<Event>,
+        rendered_system_prompt: Option<String>,
+    ) -> Result<CompletionResponse, Error> {
+        let data = event
+            .data_as_json()
+            .map_err(|source| Error::Event { source })?;
+
+        let messages: Vec<crate::ai_gateway::config::Message> = match data.get("messages") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|source| Error::PassthroughDeserialize { source })?,
+            None => Vec::new(),
+        };
+        let tools: Vec<crate::ai_gateway::config::ToolDefinition> = match data.get("tools") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .map_err(|source| Error::PassthroughDeserialize { source })?,
+            _ => Vec::new(),
+        };
+        let tool_choice = match data.get("tool_choice") {
+            Some(v) if !v.is_null() => Some(v.clone()),
+            _ => None,
+        };
+        let temperature = data
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|t| t as f32);
+        let max_tokens = data
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|t| t as u32);
+
+        let request = super::passthrough::build_request(
+            Some(client.model().to_string()),
+            rendered_system_prompt,
+            &messages,
+            &tools,
+            tool_choice,
+            temperature,
+            max_tokens,
+        )
+        .map_err(|source| Error::PassthroughBuild { source })?;
+
+        let resp = client
+            .completion_passthrough(request)
+            .await
+            .map_err(|source| Error::AgentClient { source })?;
+
+        Ok(CompletionResponse {
+            text: super::passthrough::text_from_choice(&resp.choice),
+            model: self.config.model.clone(),
+            provider: format!("{:?}", self.config.provider),
+            usage: None,
+            tool_calls: super::passthrough::tool_calls_from_choice(&resp.choice),
+        })
+    }
+
+    /// Streaming passthrough: reads OpenAI-shape event data, opens a
+    /// rig streaming completion, and forwards text deltas as
+    /// intermediate `CompletionChunk` events. Tool calls surface on
+    /// the final chunk so the gateway can emit the OpenAI
+    /// `tool_calls` delta + `finish_reason: "tool_calls"` sequence.
+    async fn passthrough_stream_response(
+        &self,
+        client: &crate::agent::AgentClient,
+        event: &Arc<Event>,
+        rendered_system_prompt: Option<String>,
+    ) -> Result<(), Error> {
+        use crate::agent::PassthroughStreamEvent;
+        use futures_util::StreamExt;
+
+        let completion_tx_arc = Arc::clone(event).completion_tx.clone();
+        let data = event
+            .data_as_json()
+            .map_err(|source| Error::Event { source })?;
+
+        let messages: Vec<crate::ai_gateway::config::Message> = match data.get("messages") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|source| Error::PassthroughDeserialize { source })?,
+            None => Vec::new(),
+        };
+        let tools: Vec<crate::ai_gateway::config::ToolDefinition> = match data.get("tools") {
+            Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                .map_err(|source| Error::PassthroughDeserialize { source })?,
+            _ => Vec::new(),
+        };
+        let tool_choice = match data.get("tool_choice") {
+            Some(v) if !v.is_null() => Some(v.clone()),
+            _ => None,
+        };
+        let temperature = data
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|t| t as f32);
+        let max_tokens = data
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|t| t as u32);
+
+        let request = super::passthrough::build_request(
+            Some(client.model().to_string()),
+            rendered_system_prompt,
+            &messages,
+            &tools,
+            tool_choice,
+            temperature,
+            max_tokens,
+        )
+        .map_err(|source| Error::PassthroughBuild { source })?;
+
+        let mut stream = client
+            .completion_stream_passthrough(request)
+            .await
+            .map_err(|source| Error::AgentClient { source })?;
+
+        let mut index: usize = 0;
+        let mut accumulated_text = String::new();
+        let mut collected_tool_calls: Vec<crate::ai_gateway::config::ToolCall> = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            if self.task_context.cancellation_token.is_cancelled() {
+                return Ok(());
+            }
+            match item {
+                Ok(PassthroughStreamEvent::Text(text)) if text.is_empty() => {}
+                Ok(PassthroughStreamEvent::Text(text)) => {
+                    accumulated_text.push_str(&text);
+                    let chunk = CompletionChunk {
+                        text,
+                        is_final: false,
+                        index,
+                        tool_calls: Vec::new(),
+                        reasoning: None,
+                    };
+                    let payload = serde_json::to_value(&chunk)
+                        .map_err(|source| Error::SerdeJson { source })?;
+                    let e = EventBuilder::new()
+                        .data(EventData::Json(payload))
+                        .subject(self.config.name.clone())
+                        .task_id(self.task_id)
+                        .task_type(self.task_type)
+                        .build()
+                        .map_err(|source| Error::EventBuilder { source })?;
+                    e.send_silent(self.tx.as_ref())
+                        .await
+                        .map_err(|source| Error::SendMessage { source })?;
+                    index += 1;
+                }
+                Ok(PassthroughStreamEvent::ToolCall(call)) => {
+                    collected_tool_calls
+                        .push(super::passthrough::rig_tool_call_to_oai_public(&call));
+                }
+                Ok(PassthroughStreamEvent::Done) => break,
+                Err(source) => return Err(Error::CompletionFailed(source.to_string())),
+            }
+        }
+
+        let final_chunk = CompletionChunk {
+            text: accumulated_text,
+            is_final: true,
+            index,
+            tool_calls: collected_tool_calls,
+            reasoning: None,
+        };
+        let payload =
+            serde_json::to_value(&final_chunk).map_err(|source| Error::SerdeJson { source })?;
+
+        let mut e = EventBuilder::new()
+            .data(EventData::Json(payload))
+            .subject(self.config.name.clone())
+            .task_id(self.task_id)
+            .task_type(self.task_type)
+            .build()
+            .map_err(|source| Error::EventBuilder { source })?;
+
+        match self.tx {
+            None => {
+                if let Some(arc) = completion_tx_arc.as_ref() {
+                    arc.signal_completion(e.data_as_json().ok());
+                }
+            }
+            Some(_) => {
+                e.completion_tx = completion_tx_arc.clone();
+            }
+        }
+
+        e.send_with_logging(self.tx.as_ref())
+            .await
+            .map_err(|source| Error::SendMessage { source })?;
+
+        Ok(())
     }
 
     /// Streaming completion: emits intermediate chunk events as they arrive,
@@ -370,6 +663,15 @@ impl EventHandler {
 
         flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
             let (rendered_prompt, rendered_system_prompt) = self.render_prompts(&event).await?;
+
+            // Streaming passthrough path — mirrors the non-streaming
+            // branch in `handle_non_streaming`. Feeds an OpenAI-shape
+            // event stream back through the same downstream channel.
+            if self.should_passthrough(&event)? {
+                return self
+                    .passthrough_stream_response(&client, &event, rendered_system_prompt)
+                    .await;
+            }
 
             let mut stream = client
                 .complete_stream(&rendered_prompt, rendered_system_prompt.as_deref())
@@ -407,6 +709,8 @@ impl EventHandler {
                             text,
                             is_final: false,
                             index,
+                            tool_calls: Vec::new(),
+                            reasoning: None,
                         };
                         let data = serde_json::to_value(&chunk_event)
                             .map_err(|source| Error::SerdeJson { source })?;
@@ -429,7 +733,33 @@ impl EventHandler {
                             .map_err(|source| Error::SendMessage { source })?;
                         index += 1;
                     }
-                    AgentChunk::Final(text) => {
+                    AgentChunk::Reasoning(text) => {
+                        let chunk_event = CompletionChunk {
+                            text: String::new(),
+                            is_final: false,
+                            index,
+                            tool_calls: Vec::new(),
+                            reasoning: Some(text),
+                        };
+                        let data = serde_json::to_value(&chunk_event)
+                            .map_err(|source| Error::SerdeJson { source })?;
+
+                        let e = EventBuilder::new()
+                            .data(EventData::Json(data))
+                            .subject(self.config.name.clone())
+                            .task_id(self.task_id)
+                            .task_type(self.task_type)
+                            .build()
+                            .map_err(|source| Error::EventBuilder { source })?;
+
+                        e.send_silent(self.tx.as_ref())
+                            .await
+                            .map_err(|source| Error::SendMessage { source })?;
+                        index += 1;
+                    }
+                    AgentChunk::Final { text, usage: _ } => {
+                        // Streaming wire chunk carries no usage field yet;
+                        // aggregated usage is dropped until it is added.
                         accumulated_text = text;
                     }
                     AgentChunk::Error(err) => {
@@ -444,6 +774,8 @@ impl EventHandler {
                 text: accumulated_text,
                 is_final: true,
                 index,
+                tool_calls: Vec::new(),
+                reasoning: None,
             };
             let data =
                 serde_json::to_value(&final_chunk).map_err(|source| Error::SerdeJson { source })?;
@@ -594,8 +926,20 @@ impl flowgen_core::task::runner::Runner for Processor {
                             url: mcp_config.url.clone(),
                             source,
                         })?;
-                    if let Some(bearer_token) = creds.bearer_auth {
-                        transport_config = transport_config.auth_header(bearer_token);
+                    // Route through custom_headers rather than auth_header:
+                    // rmcp's auth_header wraps its value in `Bearer <...>`,
+                    // which would double-prefix Basic credentials.
+                    if let Some(header_value) = creds.authorization_header() {
+                        let value =
+                            http::HeaderValue::from_str(&header_value).map_err(|source| {
+                                Error::McpAuthHeader {
+                                    url: mcp_config.url.clone(),
+                                    source,
+                                }
+                            })?;
+                        let mut headers = std::collections::HashMap::new();
+                        headers.insert(http::header::AUTHORIZATION, value);
+                        transport_config = transport_config.custom_headers(headers);
                     }
                 }
 
@@ -796,6 +1140,7 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             }),
+            tool_calls: Vec::new(),
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -810,6 +1155,8 @@ mod tests {
             text: "Hello".to_string(),
             is_final: false,
             index: 0,
+            tool_calls: Vec::new(),
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -842,6 +1189,7 @@ mod tests {
             model: "gpt-4".to_string(),
             provider: "OpenAi".to_string(),
             usage: None,
+            tool_calls: Vec::new(),
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert!(!v.as_object().unwrap().contains_key("usage"));
@@ -880,6 +1228,8 @@ mod tests {
             text: "partial".to_string(),
             is_final: false,
             index: 3,
+            tool_calls: Vec::new(),
+            reasoning: None,
         };
         let v = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["text"], "partial");
@@ -893,6 +1243,8 @@ mod tests {
             text: "full accumulated response".to_string(),
             is_final: true,
             index: 10,
+            tool_calls: Vec::new(),
+            reasoning: None,
         };
         let v = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["is_final"], true);
@@ -905,6 +1257,8 @@ mod tests {
             text: "text".to_string(),
             is_final: false,
             index: 0,
+            tool_calls: Vec::new(),
+            reasoning: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let back: CompletionChunk = serde_json::from_str(&json).unwrap();

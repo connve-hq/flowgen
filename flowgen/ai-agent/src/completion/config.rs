@@ -91,6 +91,18 @@ pub struct Processor {
     /// Enable streaming mode (sends chunks as separate events).
     #[serde(default)]
     pub stream: bool,
+    /// Bypass rig's `Agent` tool-execution loop and forward
+    /// caller-supplied `tools`/`tool_choice` straight to the upstream
+    /// provider. Tool invocations returned by the model are surfaced
+    /// verbatim as `tool_calls` on the response instead of being
+    /// executed in-process. Use this when a client (e.g. opencode,
+    /// Claude Desktop) will execute the tools itself and only needs
+    /// the AI gateway as a protocol proxy. Requires the client to
+    /// supply `tools: [...]` in the request body; a request without
+    /// tools follows the normal completion path even when this flag
+    /// is on.
+    #[serde(default)]
+    pub tool_passthrough: bool,
     /// Optional MCP server URLs to connect to for tool discovery.
     /// The agent will connect to each MCP server, discover available tools,
     /// and make them callable during completions. Supports both flowgen's
@@ -116,6 +128,128 @@ pub struct Processor {
     /// Optional retry configuration (overrides app-level retry config).
     #[serde(default)]
     pub retry: Option<flowgen_core::retry::RetryConfig>,
+    /// Optional extended-thinking / reasoning configuration.
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// Extended-thinking / reasoning configuration.
+///
+/// `effort` is the portable knob; it maps to `reasoning_effort` for
+/// OpenAI-shape providers and to a token budget for Anthropic/Gemini.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+pub struct ThinkingConfig {
+    pub effort: Effort,
+    /// Whether to receive the reasoning trace in the stream.
+    #[serde(default = "default_include_trace")]
+    pub include_trace: bool,
+}
+
+fn default_include_trace() -> bool {
+    true
+}
+
+/// Reasoning intensity levels.
+#[derive(PartialEq, Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingConfig {
+    /// Renders `additional_params` for the given provider; `None` when
+    /// the provider does not expose extended thinking.
+    pub fn to_additional_params(
+        &self,
+        provider: &Provider,
+    ) -> Result<Option<serde_json::Value>, serde_json::Error> {
+        match provider {
+            Provider::Anthropic => {
+                let params = AnthropicThinkingParams {
+                    thinking: AnthropicThinking {
+                        r#type: "enabled",
+                        budget_tokens: self.anthropic_budget_tokens(),
+                    },
+                    include_thoughts: (!self.include_trace).then_some(false),
+                };
+                serde_json::to_value(params).map(Some)
+            }
+            Provider::Google | Provider::VertexAi => {
+                let params = GeminiThinkingParams {
+                    generation_config: GeminiGenerationConfig {
+                        thinking_config: GeminiThinkingBlock {
+                            thinking_budget: self.gemini_budget_tokens(),
+                            include_thoughts: self.include_trace,
+                        },
+                    },
+                };
+                serde_json::to_value(params).map(Some)
+            }
+            Provider::OpenAi | Provider::Xai | Provider::OpenRouter => {
+                let params = ReasoningEffortParams {
+                    reasoning_effort: self.effort,
+                };
+                serde_json::to_value(params).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn anthropic_budget_tokens(&self) -> u32 {
+        match self.effort {
+            Effort::Low => 1024,
+            Effort::Medium => 4096,
+            Effort::High => 16000,
+        }
+    }
+
+    fn gemini_budget_tokens(&self) -> u32 {
+        match self.effort {
+            Effort::Low => 1024,
+            Effort::Medium => 8192,
+            Effort::High => 24576,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AnthropicThinkingParams {
+    thinking: AnthropicThinking,
+    // Only emit when the caller opted out; Anthropic defaults to on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_thoughts: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct AnthropicThinking {
+    r#type: &'static str,
+    budget_tokens: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiThinkingParams {
+    generation_config: GeminiGenerationConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerationConfig {
+    thinking_config: GeminiThinkingBlock,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiThinkingBlock {
+    thinking_budget: u32,
+    include_thoughts: bool,
+}
+
+#[derive(Serialize)]
+struct ReasoningEffortParams {
+    reasoning_effort: Effort,
 }
 
 /// Configuration for connecting to an MCP server.
@@ -188,10 +322,12 @@ mod tests {
             static_context: None,
             max_turns: None,
             stream: false,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
 
         assert_eq!(processor.name, "test");
@@ -227,10 +363,12 @@ mod tests {
             ]),
             max_turns: Some(5),
             stream: true,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&processor).unwrap();
@@ -272,10 +410,12 @@ mod tests {
             static_context: None,
             max_turns: None,
             stream: false,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
         let _: &dyn ConfigExt = &processor;
     }
@@ -295,10 +435,12 @@ mod tests {
             static_context: None,
             max_turns: None,
             stream: true,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&processor).unwrap();
@@ -325,10 +467,12 @@ mod tests {
             static_context: None,
             max_turns: None,
             stream: false,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&processor).unwrap();
@@ -359,14 +503,91 @@ mod tests {
             ]),
             max_turns: Some(3),
             stream: false,
+            tool_passthrough: false,
             mcp_servers: vec![],
             sandbox: Default::default(),
             depends_on: None,
             retry: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&processor).unwrap();
         let deserialized: Processor = serde_json::from_str(&json).unwrap();
         assert_eq!(processor, deserialized);
+    }
+
+    #[test]
+    fn thinking_params_anthropic() {
+        let cfg = ThinkingConfig {
+            effort: Effort::Medium,
+            include_trace: true,
+        };
+        let v = cfg
+            .to_additional_params(&Provider::Anthropic)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["thinking"]["type"], "enabled");
+        assert_eq!(v["thinking"]["budget_tokens"], 4096);
+        assert!(v.get("include_thoughts").is_none());
+    }
+
+    #[test]
+    fn thinking_params_anthropic_no_trace() {
+        let cfg = ThinkingConfig {
+            effort: Effort::Low,
+            include_trace: false,
+        };
+        let v = cfg
+            .to_additional_params(&Provider::Anthropic)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["thinking"]["budget_tokens"], 1024);
+        assert_eq!(v["include_thoughts"], false);
+    }
+
+    #[test]
+    fn thinking_params_gemini() {
+        let cfg = ThinkingConfig {
+            effort: Effort::High,
+            include_trace: true,
+        };
+        let v = cfg
+            .to_additional_params(&Provider::Google)
+            .unwrap()
+            .unwrap();
+        let block = &v["generationConfig"]["thinkingConfig"];
+        assert_eq!(block["thinkingBudget"], 24576);
+        assert_eq!(block["includeThoughts"], true);
+    }
+
+    #[test]
+    fn thinking_params_openai_effort() {
+        let cfg = ThinkingConfig {
+            effort: Effort::Medium,
+            include_trace: true,
+        };
+        let v = cfg
+            .to_additional_params(&Provider::OpenAi)
+            .unwrap()
+            .unwrap();
+        assert_eq!(v["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn thinking_params_unsupported_provider() {
+        let cfg = ThinkingConfig {
+            effort: Effort::High,
+            include_trace: true,
+        };
+        let cohere = cfg.to_additional_params(&Provider::Cohere).unwrap();
+        let groq = cfg.to_additional_params(&Provider::Groq).unwrap();
+        assert!(cohere.is_none());
+        assert!(groq.is_none());
+    }
+
+    #[test]
+    fn thinking_include_trace_defaults_to_true() {
+        let cfg: ThinkingConfig = serde_json::from_str(r#"{"effort":"low"}"#).unwrap();
+        assert!(cfg.include_trace);
     }
 }

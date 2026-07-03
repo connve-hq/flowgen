@@ -130,6 +130,10 @@ pub enum TaskType {
     ai_completion(flowgen_ai_agent::completion::config::Processor),
     /// MCP tool task for exposing flows as MCP tools callable by LLMs.
     mcp_tool(flowgen_mcp::config::Processor),
+    /// MCP resource task for exposing read-only content to MCP clients.
+    mcp_resource(flowgen_mcp::resource::config::Processor),
+    /// MCP prompt task for exposing slash-command templates to MCP clients.
+    mcp_prompt(flowgen_mcp::prompt::config::Processor),
     /// LLM proxy task — registers a flow as a backend on the AI gateway server.
     llm_proxy(flowgen_ai_agent::ai_gateway::config::Processor),
     /// Git sync task for syncing flows and resources from a Git repository to the cache.
@@ -170,6 +174,8 @@ impl TaskType {
             TaskType::nats_kv_store(_) => "nats_kv_store",
             TaskType::ai_completion(_) => "ai_completion",
             TaskType::mcp_tool(_) => "mcp_tool",
+            TaskType::mcp_resource(_) => "mcp_resource",
+            TaskType::mcp_prompt(_) => "mcp_prompt",
             TaskType::llm_proxy(_) => "llm_proxy",
             TaskType::git_sync(_) => "git_sync",
             TaskType::oci_sync(_) => "oci_sync",
@@ -207,10 +213,24 @@ impl TaskType {
             TaskType::nats_kv_store(c) => &c.name,
             TaskType::ai_completion(c) => &c.name,
             TaskType::mcp_tool(c) => &c.name,
+            TaskType::mcp_resource(c) => &c.name,
+            TaskType::mcp_prompt(c) => &c.name,
             TaskType::llm_proxy(c) => &c.name,
             TaskType::git_sync(c) => &c.name,
             TaskType::oci_sync(c) => &c.name,
         }
+    }
+
+    /// Whether this task participates in the event pipeline.
+    ///
+    /// Registration-only tasks (`mcp_prompt`, `mcp_resource`) publish their
+    /// entry to the shared MCP server at init and exit — the client-facing
+    /// `prompts/get` and `resources/read` calls are served by the MCP HTTP
+    /// server, never through the flow pipeline. They therefore have no
+    /// inbound channel, no outbound channel, and no implicit dependency on
+    /// the preceding task in the flow list.
+    pub const fn has_pipeline_io(&self) -> bool {
+        !matches!(self, TaskType::mcp_prompt(_) | TaskType::mcp_resource(_))
     }
 
     /// Returns the `depends_on` list if configured on the task.
@@ -244,6 +264,8 @@ impl TaskType {
             TaskType::nats_kv_store(c) => c.depends_on.as_ref(),
             TaskType::ai_completion(c) => c.depends_on.as_ref(),
             TaskType::mcp_tool(c) => c.depends_on.as_ref(),
+            TaskType::mcp_resource(c) => c.depends_on.as_ref(),
+            TaskType::mcp_prompt(c) => c.depends_on.as_ref(),
             TaskType::llm_proxy(c) => c.depends_on.as_ref(),
             TaskType::git_sync(c) => c.depends_on.as_ref(),
             TaskType::oci_sync(c) => c.depends_on.as_ref(),
@@ -438,6 +460,17 @@ pub struct McpServerOptions {
     /// Optional auth provider configuration for user identity resolution.
     /// Shared across all `mcp_tool` flows on this worker.
     pub auth: Option<flowgen_core::auth::AuthConfig>,
+    /// URI scheme used when auto-generating `mcp_resource` URIs of the form
+    /// `<scheme>://<flow_name>/<name>`. White-label deployments override
+    /// this (e.g. `acme`) so URIs emitted to LLM clients carry the
+    /// deployment's brand instead of `flowgen`.
+    #[serde(default = "default_resource_uri_scheme")]
+    pub resource_uri_scheme: String,
+}
+
+/// Default scheme for auto-generated MCP resource URIs.
+fn default_resource_uri_scheme() -> String {
+    "flowgen".to_string()
 }
 
 /// Default AI gateway port.
@@ -452,6 +485,16 @@ fn default_ai_gateway_port() -> u16 {
 /// and reach `POST /v1/chat/completions` and `GET /v1/models` directly.
 fn default_ai_gateway_path() -> String {
     "/v1".to_string()
+}
+
+/// Default max request body size for the AI gateway (128 MiB). Sized for
+/// modern 1 M-token context windows plus tool schemas and history —
+/// roughly 4 bytes per token after JSON overhead means a full 1 M-token
+/// prompt lands around 4 MB; the 128 MiB ceiling absorbs multi-turn
+/// histories and worst-case tool-payload growth without needing per-flow
+/// overrides.
+fn default_ai_gateway_max_body_bytes() -> usize {
+    128 * 1024 * 1024
 }
 
 /// AI gateway server configuration options.
@@ -479,6 +522,12 @@ pub struct AiGatewayOptions {
     /// Optional auth provider configuration for user identity resolution.
     /// Shared across all AI gateway flows on this worker.
     pub auth: Option<flowgen_core::auth::AuthConfig>,
+    /// Maximum request body size in bytes. Defaults to 128 MiB, which
+    /// covers 1 M-token prompts with tool schemas and multi-turn
+    /// histories. Requests over this limit are rejected with
+    /// `413 Payload Too Large`.
+    #[serde(default = "default_ai_gateway_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 /// Default webhook HTTP server port.
