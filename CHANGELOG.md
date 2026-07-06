@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.122.0
+
+### Features
+
+- **`braze_export_users_ids` task for Braze user profile exports.** New
+  `flowgen_braze` crate wraps the Braze REST SDK and exposes
+  `POST /users/export/ids` as a flowgen processor. Supports all Braze
+  identifier types (`external_ids`, `user_aliases`, `device_id`,
+  `braze_id`, `email_address`, `phone`) and `fields_to_export`.
+  Identifier values can be static strings or Handlebars templates
+  rendered against the incoming event. The Braze response is emitted as
+  a JSON event downstream. Configuration uses `credentials_path`
+  pointing to a JSON file with `api_key` and `rest_endpoint`. See
+  `examples/braze/export_users_ids.yaml`.
+
+- **AI gateway speaks Anthropic and forwards token usage.** The
+  `llm_proxy` task grows a `protocol` field: leaving it at the
+  default `openai` keeps `POST /v1/chat/completions` behaviour
+  unchanged, while `protocol: anthropic` mounts `POST /v1/messages`
+  on the same server so clients honouring `ANTHROPIC_BASE_URL`
+  (Claude Code, the official Anthropic SDKs) reach downstream
+  OpenAI-compatible providers through the gateway with no client
+  changes. Anthropic's `x-api-key` header is folded into the
+  standard `Authorization: Bearer` before endpoint-level auth runs,
+  so existing credentials JSON files keep working unchanged. Model
+  routing follows the same `<proxy-name>/<downstream-model>`
+  convention as OpenAI. Both protocols share a single
+  `EventPayload` in `event.data`, so a leaf `ai_completion` task
+  never learns which protocol the client used.
+
+  Token usage now round-trips end-to-end. Non-streaming responses
+  populate `ChatCompletionResponse.usage` (OpenAI) or the response
+  `usage` field (Anthropic) whenever the leaf task reports it. For
+  OpenAI streaming the gateway follows the spec: usage rides an
+  extra SSE frame with `choices: []` and `usage: {...}` immediately
+  before `data: [DONE]`, and only when the client opts in with
+  `stream_options.include_usage: true`. Without the opt-in the
+  stream stays byte-for-byte compatible with clients that never
+  expect the extra frame. Anthropic streaming always attaches usage
+  to `message_delta`, matching the upstream API. Malformed leaf
+  usage is logged and dropped rather than propagated so token
+  accounting never fails an otherwise successful completion.
+
+- **`bigquery_query` streams one event per result page.** Previous
+  path buffered all `getQueryResults` pages into a single
+  `RecordBatch` before emitting; peak RAM was ~2× the query result.
+  Now each page is emitted as it arrives, with `completion_tx`
+  peeked one page ahead. `job_id` stamped on the first event only.
+
+- **`bigquery_query` optional Storage Read backend.** New
+  `use_storage_read: bool` (default `false`) on the task config.
+  When enabled, the query result flows through the BigQuery Storage
+  Read API and is emitted one Arrow batch at a time via the same
+  `RecordBatchIterator` the `bigquery_storage_read` task uses, so
+  large result sets (over one million rows) skip the per-row `Tuple`
+  conversion the REST backend pays. Trade-off: adds temporary-table
+  overhead for small queries and is not compatible with
+  data-definition or data-manipulation statements. Backed by the new
+  upstream `query_record_batches` helper in
+  `connve/google-cloud-rust`.
+
+- **`bigquery_storage_read` streams RecordBatches from the wire.**
+  The processor no longer collects the full result set before emitting
+  the first downstream event; each Arrow `RecordBatch` returned by the
+  Storage Read API is emitted as its own event as it arrives, with
+  `completion_tx` peeked one batch ahead so it still attaches to the
+  final event. Small tables that used to choke on ~5K rows now feel
+  instant: the previous `RecordBatchMarker` + `StructDecodable` hack
+  forced the upstream library to allocate one marker per row (a
+  5,000-element `VecDeque` for a single Arrow batch, 4,999 of which
+  were immediately discarded), deep-clone each column's `DataType`,
+  and rebuild the schema client-side for every batch. All of that is
+  gone. Backed by a new upstream `read_table_record_batches` /
+  `RecordBatchIterator` API in the pinned `connve/google-cloud-rust`
+  fork, which decodes Arrow IPC bytes once per BQ batch instead of
+  once per row and yields `RecordBatch` directly. Arrow bumped from
+  56.1 → 58.3 workspace-wide to match the fork; no API drift in
+  flowgen call sites.
+
+- **`oci_sync` unpacks tar and tar+gzip layers.** Container images
+  pushed with `docker push` (scratch-based or otherwise) and OCI
+  artifacts whose layers use `application/vnd.oci.image.layer.v1.tar+gzip`
+  or `application/vnd.docker.image.rootfs.diff.tar.gzip` now flow
+  through the same bootstrap pipeline as raw oras artifacts. The
+  layer's media type dispatches the extractor: raw layers still emit
+  one `FileEvent` per layer with the path taken from
+  `org.opencontainers.image.title`; tar and tar+gzip layers emit one
+  `FileEvent` per file entry, with the path taken from the tar entry
+  name (leading `/` stripped). Directories, symlinks, hardlinks, and
+  docker whiteout markers (`.wh.*`) are skipped. This unblocks
+  tenants whose CI can push Docker images but not `oras`
+  artifacts — a common Artifactory / enterprise-CI constraint.
+
+  Two new fields on `oci_sync` guard against tar-bomb layers:
+  `max_file_size` (default 10 MB, per extracted file) and
+  `max_total_size` (default 100 MB, cumulative across all layers of
+  one artifact). Both are enforced during tar iteration, so a
+  malicious layer fails fast before consuming memory. Raw layers
+  are subject to the same caps.
+
+### Breaking changes
+
+- **AI gateway event meta: `model` → `requested_model`.** The gateway
+  now writes the client-requested alias under `event.meta.requested_model`;
+  the completion leaf still writes the actual upstream model under
+  `event.meta.model`. Update flows and scripts accordingly.
+
+### Fixes
+
+- **`git_sync` now sees new upstream commits without a pod restart.**
+  The previous `fetch_existing` path only advanced the
+  remote-tracking ref; it never updated `refs/heads/<branch>` or the
+  working tree, so `head_commit` kept returning the original
+  shallow-clone commit and the file walk was skipped on every tick.
+  `git_sync` now wipes and re-clones the `clone_path` at the start
+  of every sync. Shallow clone at depth 1 transfers the same pack
+  file the fetch would have — the cost is one `remove_dir_all` on
+  ~KB of shallow state — and guarantees the working tree matches
+  HEAD every tick. Discovered by the new git integration tests;
+  `Error::Fetch` (unused after the removal) went with the same
+  commit. Also fixes a related bug: when `path` was `None`, the file
+  walk descended into `.git/` and leaked `.git/config` and shallow
+  markers into the downstream pipeline; the walker now excludes the
+  `.git/` directory unconditionally.
+
+- **`oci_sync` size-cap breaches now fail fast instead of retrying
+  for ~15 minutes.** `Error::FileTooLarge` and
+  `Error::ArtifactTooLarge` were classified as transient by the
+  handler-level retry loop, so a tar-bomb artifact would loop through
+  the full retry budget before surfacing the failure to downstream —
+  defeating the "fails fast before consuming memory" promise of the
+  size caps themselves. Both errors are now classified as permanent
+  alongside `InvalidReference`, `ParseCredentials`, and
+  `InvalidLayerEncoding`, so a busted artifact reports its error to
+  downstream on the first attempt. Discovered by the new size-cap
+  integration tests.
+
 ## 0.121.0
 
 ### Features
