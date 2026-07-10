@@ -16,6 +16,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::{error, info};
 
+use base64::Engine;
+
 /// Rewrites `/`, `:`, `@` in an OCI reference to hyphens so it fits
 /// the cache key alphabet.
 fn sanitize_artifact_ref(artifact: &str) -> String {
@@ -29,24 +31,22 @@ pub struct FileEvent {
     /// File path inside the artifact, derived from the layer's
     /// `org.opencontainers.image.title` annotation.
     pub path: String,
-    /// Layer content as UTF-8.
+    /// Layer content as string. For text layers this is the decoded UTF-8
+    /// content; for binary layers it is base64-encoded and
+    /// `content_encoding` is set to `"base64"`.
     pub content: String,
     /// Layer blob digest.
     pub digest: String,
     /// Whole-artifact manifest digest (same across all events for one pull).
     pub artifact_digest: String,
+    /// Optional content encoding. When set to `"base64"` the `content`
+    /// field holds a base64-encoded binary payload; downstream tasks
+    /// decode before writing to a file or processing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
 }
 
-/// Meta attached to `EventData::Bytes` layer events so downstream tasks
-/// can still route by path and digest even when the payload is binary.
-#[derive(Debug, Clone, serde::Serialize)]
-struct BinaryLayerMeta {
-    path: String,
-    digest: String,
-    artifact_digest: String,
-}
-
-/// Intermediate carrier before per-layer UTF-8 fallback picks JSON or Bytes.
+/// Intermediate carrier before per-layer content encoding decision.
 struct PendingFileEvent {
     path: String,
     content: Vec<u8>,
@@ -507,48 +507,32 @@ impl EventHandler {
                     artifact_digest,
                 } = pending;
 
-                let (data, meta) = match String::from_utf8(content) {
-                    Ok(text) => {
-                        let file_event = FileEvent {
-                            path,
-                            content: text,
-                            digest,
-                            artifact_digest,
-                        };
-                        let data = EventData::Json(
-                            serde_json::to_value(&file_event)
-                                .map_err(|source| Error::SerdeJson { source })?,
-                        );
-                        (data, None)
-                    }
+                let (text_content, content_encoding) = match String::from_utf8(content) {
+                    Ok(text) => (text, None),
                     Err(err) => {
-                        // Binary layer: surface path + digests in meta so
-                        // downstream tasks can still route by key.
-                        let bytes = bytes::Bytes::from(err.into_bytes());
-                        let meta_struct = BinaryLayerMeta {
-                            path,
-                            digest,
-                            artifact_digest,
-                        };
-                        let meta_value = serde_json::to_value(&meta_struct)
-                            .map_err(|source| Error::SerdeJson { source })?;
-                        let meta_map = match meta_value {
-                            serde_json::Value::Object(map) => Some(map),
-                            _ => Some(serde_json::Map::new()),
-                        };
-                        (EventData::Bytes(bytes), meta_map)
+                        let raw = err.into_bytes();
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+                        (encoded, Some("base64".to_string()))
                     }
                 };
 
-                let mut builder = EventBuilder::new()
+                let file_event = FileEvent {
+                    path,
+                    content: text_content,
+                    digest,
+                    artifact_digest,
+                    content_encoding,
+                };
+                let data = EventData::Json(
+                    serde_json::to_value(&file_event)
+                        .map_err(|source| Error::SerdeJson { source })?,
+                );
+
+                let mut e = EventBuilder::new()
                     .data(data)
                     .subject(self.config.name.clone())
                     .task_id(self.task_id)
-                    .task_type(self.task_type);
-                if let Some(meta_map) = meta {
-                    builder = builder.meta(meta_map);
-                }
-                let mut e = builder
+                    .task_type(self.task_type)
                     .build()
                     .map_err(|source| Error::EventBuilder { source })?;
 
@@ -992,12 +976,32 @@ mod tests {
             content: "name: test".to_string(),
             digest: "sha256:abc".to_string(),
             artifact_digest: "sha256:def".to_string(),
+            content_encoding: None,
         };
         let value = serde_json::to_value(&fe).unwrap();
         assert_eq!(value["path"], "flows/main.yaml");
         assert_eq!(value["content"], "name: test");
         assert_eq!(value["digest"], "sha256:abc");
         assert_eq!(value["artifact_digest"], "sha256:def");
+        assert!(value.get("content_encoding").is_none());
+    }
+
+    #[test]
+    fn file_event_serialization_binary() {
+        let fe = FileEvent {
+            path: "blob.bin".to_string(),
+            content: base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            digest: "sha256:abc".to_string(),
+            artifact_digest: "sha256:def".to_string(),
+            content_encoding: Some("base64".to_string()),
+        };
+        let value = serde_json::to_value(&fe).unwrap();
+        assert_eq!(value["path"], "blob.bin");
+        assert_eq!(
+            value["content"],
+            base64::engine::general_purpose::STANDARD.encode(b"hello")
+        );
+        assert_eq!(value["content_encoding"], "base64");
     }
 
     #[test]
@@ -1089,12 +1093,14 @@ mod tests {
             content: "x".to_string(),
             digest: "sha256:1".to_string(),
             artifact_digest: "sha256:2".to_string(),
+            content_encoding: None,
         };
         let cloned = fe.clone();
         assert_eq!(fe.path, cloned.path);
         assert_eq!(fe.content, cloned.content);
         assert_eq!(fe.digest, cloned.digest);
         assert_eq!(fe.artifact_digest, cloned.artifact_digest);
+        assert_eq!(fe.content_encoding, cloned.content_encoding);
     }
 
     // ── load_auth integration ──────────────────────────────────────

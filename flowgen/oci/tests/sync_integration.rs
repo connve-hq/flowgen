@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use flowgen_oci::sync::config::Processor as OciSyncConfig;
 use flowgen_oci::sync::processor::ProcessorBuilder;
+use base64::Engine;
 use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -711,7 +712,7 @@ async fn oci_sync_rejects_artifact_exceeding_max_total_size() {
 /// non-UTF-8 layer would fail the entire pull with `InvalidLayerEncoding`.
 #[tokio::test]
 #[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
-async fn oci_sync_emits_bytes_event_for_binary_raw_layer() {
+async fn oci_sync_emits_json_event_for_binary_raw_layer() {
     let (_registry, host) = boot_registry().await;
 
     // Bytes that are guaranteed invalid UTF-8: a lone continuation byte
@@ -741,36 +742,31 @@ async fn oci_sync_emits_bytes_event_for_binary_raw_layer() {
 
     let event = &events[0];
     match &event.data {
-        flowgen_core::event::EventData::Bytes(bytes) => {
-            assert_eq!(bytes.as_ref(), binary_payload.as_slice());
-        }
-        other => panic!("expected EventData::Bytes for binary layer, got {other:?}"),
-    }
+        flowgen_core::event::EventData::Json(data) => {
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap();
+            assert_eq!(path, "layer-0", "raw layer without title uses fallback name");
 
-    let meta = event
-        .meta
-        .as_ref()
-        .expect("binary layer event must carry meta");
-    assert!(
-        meta.contains_key("path"),
-        "meta.path must be set for binary layer"
-    );
-    assert!(
-        meta.contains_key("digest"),
-        "meta.digest must be set for binary layer"
-    );
-    assert!(
-        meta.contains_key("artifact_digest"),
-        "meta.artifact_digest must be set for binary layer",
-    );
+            let content = data.get("content").and_then(|v| v.as_str()).unwrap();
+            let expected_base64 = base64::engine::general_purpose::STANDARD.encode(&binary_payload);
+            assert_eq!(content, expected_base64, "binary content must be base64-encoded");
+
+            let content_encoding = data.get("content_encoding").and_then(|v| v.as_str());
+            assert_eq!(content_encoding, Some("base64"), "binary event must indicate base64 encoding");
+
+            assert!(data.get("digest").is_some(), "digest must be present");
+            assert!(data.get("artifact_digest").is_some(), "artifact_digest must be present");
+        }
+        other => panic!("expected EventData::Json for binary layer, got {other:?}"),
+    }
 }
 
 /// Tar layer whose entries include a non-UTF-8 payload. Text entries must
 /// still emit the historical JSON `FileEvent` shape; the binary entry must
-/// emit `EventData::Bytes` with path + digests in meta.
+/// also emit JSON `FileEvent` with base64-encoded content and
+/// `content_encoding: "base64"`.
 #[tokio::test]
 #[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
-async fn oci_sync_emits_bytes_event_for_binary_tar_entry() {
+async fn oci_sync_emits_json_event_for_binary_tar_entry() {
     let (_registry, host) = boot_registry().await;
 
     let text_payload = b"name: text-flow\n".to_vec();
@@ -806,35 +802,38 @@ async fn oci_sync_emits_bytes_event_for_binary_tar_entry() {
     let mut saw_text = false;
     let mut saw_binary = false;
     for event in &events {
-        match &event.data {
-            flowgen_core::event::EventData::Json(_) => {
-                let data = event.data_as_json().expect("text event carries JSON data");
-                assert_eq!(
-                    data.get("path").and_then(|v| v.as_str()),
-                    Some("flows/text.yaml")
-                );
+        let data = event.data_as_json().expect("all events must carry JSON data");
+        let path = data.get("path").and_then(|v| v.as_str()).unwrap();
+        match path {
+            "flows/text.yaml" => {
                 assert_eq!(
                     data.get("content").and_then(|v| v.as_str()),
                     Some("name: text-flow\n")
                 );
+                assert!(
+                    data.get("content_encoding").is_none(),
+                    "text entry must not have content_encoding",
+                );
                 saw_text = true;
             }
-            flowgen_core::event::EventData::Bytes(bytes) => {
-                assert_eq!(bytes.as_ref(), binary_payload.as_slice());
-                let meta = event.meta.as_ref().expect("binary event must carry meta");
+            "blobs/module.wasm" => {
+                let content = data.get("content").and_then(|v| v.as_str()).unwrap();
+                let expected_base64 =
+                    base64::engine::general_purpose::STANDARD.encode(&binary_payload);
+                assert_eq!(content, expected_base64);
                 assert_eq!(
-                    meta.get("path").and_then(|v| v.as_str()),
-                    Some("blobs/module.wasm"),
+                    data.get("content_encoding").and_then(|v| v.as_str()),
+                    Some("base64"),
                 );
-                assert!(meta.contains_key("digest"));
-                assert!(meta.contains_key("artifact_digest"));
+                assert!(data.get("digest").is_some());
+                assert!(data.get("artifact_digest").is_some());
                 saw_binary = true;
             }
-            other => panic!("unexpected event data variant: {other:?}"),
+            other => panic!("unexpected path: {other}"),
         }
     }
     assert!(saw_text, "text tar entry must emit JSON FileEvent");
-    assert!(saw_binary, "binary tar entry must emit EventData::Bytes");
+    assert!(saw_binary, "binary tar entry must emit JSON FileEvent with base64 content");
 }
 
 /// Pushes multiple tar+gzip layers under `<host>/<repo>:latest` without
