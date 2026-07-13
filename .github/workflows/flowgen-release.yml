@@ -261,6 +261,13 @@ jobs:
       - name: Install dependencies
         run: brew install protobuf
 
+      # Node is required by `flowgen/app/build.rs`.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Build binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin flowgen
 

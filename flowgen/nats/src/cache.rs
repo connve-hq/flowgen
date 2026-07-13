@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Number of historical entries retained per key in the KV bucket.
-const DEFAULT_HISTORY: i64 = 10;
+const DEFAULT_HISTORY: i64 = 1_000;
 
 /// Default TTL for KV delete and purge tombstone markers.
 ///
@@ -165,7 +165,7 @@ impl flowgen_core::cache::Cache for Cache {
             .as_ref()
             .ok_or_else(|| flowgen_core::cache::CacheError::StoreNotInitialized)?;
 
-        let subject = format!("{}{}", &store.prefix, key);
+        let subject = format!("{}{}", store.prefix, key);
 
         let mut headers = async_nats::HeaderMap::new();
         if let Some(ttl) = ttl_secs {
@@ -230,7 +230,7 @@ impl flowgen_core::cache::Cache for Cache {
             .as_ref()
             .ok_or_else(|| flowgen_core::cache::CacheError::StoreNotInitialized)?;
 
-        let subject = format!("{}{}", &store.prefix, key);
+        let subject = format!("{}{}", store.prefix, key);
 
         let mut headers = async_nats::HeaderMap::new();
         if let Some(ttl) = ttl_secs {
@@ -282,7 +282,7 @@ impl flowgen_core::cache::Cache for Cache {
             .as_ref()
             .ok_or_else(|| flowgen_core::cache::CacheError::StoreNotInitialized)?;
 
-        let subject = format!("{}{}", &store.prefix, key);
+        let subject = format!("{}{}", store.prefix, key);
 
         let mut headers = async_nats::HeaderMap::new();
         if let Some(ttl) = ttl_secs {
@@ -406,11 +406,13 @@ impl flowgen_core::cache::Cache for Cache {
 
     /// Subscribes to key changes under the given prefix.
     ///
-    /// Uses NATS KV watch without history replay — startup load via `list_keys` already
-    /// handles the initial state, so we only want events that arrive after the watcher starts.
+    /// When `include_history` is true, replays retained per-key history (up to
+    /// the bucket's `history` setting) before switching to live updates —
+    /// enabling consumers to reconstruct recent state on connect.
     async fn watch(
         &self,
         prefix: &str,
+        include_history: bool,
     ) -> Result<
         futures_util::stream::BoxStream<
             'static,
@@ -429,7 +431,11 @@ impl flowgen_core::cache::Cache for Cache {
 
         // Append the NATS wildcard so the watch covers all keys under the prefix.
         let subject = format!("{prefix}.>");
-        let watcher = store.watch(subject).await.map_err(|e| {
+        let watcher = match include_history {
+            true => store.watch_with_history(subject).await,
+            false => store.watch(subject).await,
+        }
+        .map_err(|e| {
             flowgen_core::cache::CacheError::WatchFailed(Box::new(Error::KVWatch { source: e }))
         })?;
 

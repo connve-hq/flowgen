@@ -9,4 +9,15 @@ docker
 /vendor
 /local
 /docs
+!/docs/static/icons
+!/docs/static/icons/**
 **/*.md
+
+# web (SvelteKit) — build outputs & deps, keep sources for embed
+/web/node_modules
+/web/build
+/web/.svelte-kit
+/web/dist
+/web/.vite
+/web/.env
+/web/.env.*
