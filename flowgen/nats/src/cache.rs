@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Number of historical entries retained per key in the KV bucket.
-const DEFAULT_HISTORY: i64 = 1_000;
+/// NATS server caps this at 64 for KV buckets.
+const DEFAULT_HISTORY: i64 = 64;
 
 /// Default TTL for KV delete and purge tombstone markers.
 ///
@@ -81,7 +82,7 @@ pub enum Error {
 /// NATS JetStream Key-Value store cache.
 #[derive(Debug, Default)]
 pub struct Cache {
-    credentials_path: PathBuf,
+    credentials_path: Option<PathBuf>,
     url: String,
     history: Option<i64>,
     tombstone_ttl: Option<Duration>,
@@ -92,9 +93,12 @@ pub struct Cache {
 impl Cache {
     /// Connects to NATS and initializes the KV bucket.
     pub async fn init(mut self, bucket: &str) -> Result<Self, Error> {
-        let client = crate::client::ClientBuilder::new()
-            .credentials_path(self.credentials_path.clone())
-            .url(self.url.clone())
+        let mut builder = crate::client::ClientBuilder::new();
+        builder.url(self.url.clone());
+        if let Some(path) = self.credentials_path.clone() {
+            builder.credentials_path(path);
+        }
+        let client = builder
             .build()
             .map_err(|source| Error::ClientAuth { source })?
             .connect()
@@ -362,10 +366,16 @@ impl flowgen_core::cache::Cache for Cache {
         store
             .delete_expect_revision(key, Some(expected_revision))
             .await
-            .map_err(|e| {
-                flowgen_core::cache::CacheError::DeleteFailed(Box::new(Error::KVDelete {
+            .map_err(|e| match e.kind() {
+                async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision => {
+                    flowgen_core::cache::CacheError::RevisionMismatch {
+                        expected: expected_revision,
+                        actual: 0,
+                    }
+                }
+                _ => flowgen_core::cache::CacheError::DeleteFailed(Box::new(Error::KVDelete {
                     source: e,
-                }))
+                })),
             })
     }
 
@@ -518,18 +528,11 @@ impl CacheBuilder {
         self
     }
 
-    /// Builds the [`Cache`].
-    ///
-    /// Consumes builder. `Cache` is returned unconnected; call `init()` to connect.
-    ///
-    /// # Returns
-    /// * `Ok(Cache)` on success.
-    /// * `Err(Error::MissingBuilderAttribute)` if `credentials_path` is missing.
+    /// Builds the [`Cache`]. Cache is returned unconnected; call
+    /// `init()` to connect.
     pub fn build(self) -> Result<Cache, Error> {
         Ok(Cache {
-            credentials_path: self
-                .credentials_path
-                .ok_or_else(|| Error::MissingBuilderAttribute("credentials_path".to_string()))?,
+            credentials_path: self.credentials_path,
             url: self
                 .url
                 .unwrap_or_else(|| crate::client::DEFAULT_NATS_URL.to_string()),
@@ -574,11 +577,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn builder_build_fails_without_credentials_path() {
-        let result = CacheBuilder::new().build();
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("credentials_path"));
+    fn builder_build_without_credentials_leaves_field_none() {
+        let cache = CacheBuilder::new().build().unwrap();
+        assert!(cache.credentials_path.is_none());
+        assert_eq!(cache.url, crate::client::DEFAULT_NATS_URL);
+        assert!(cache.store.is_none());
+        assert!(cache.jetstream.is_none());
     }
 
     #[test]
@@ -587,7 +591,10 @@ mod tests {
             .credentials_path(PathBuf::from("/etc/nats/creds"))
             .build()
             .unwrap();
-        assert_eq!(cache.credentials_path, PathBuf::from("/etc/nats/creds"));
+        assert_eq!(
+            cache.credentials_path,
+            Some(PathBuf::from("/etc/nats/creds"))
+        );
         assert_eq!(cache.url, crate::client::DEFAULT_NATS_URL);
         assert!(cache.store.is_none());
         assert!(cache.jetstream.is_none());

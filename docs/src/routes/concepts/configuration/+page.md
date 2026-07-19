@@ -10,6 +10,7 @@ http_server:       # Webhook / metrics HTTP server (optional).
 mcp_server:        # MCP server for tools/resources/prompts (optional).
 ai_gateway:        # OpenAI-compatible LLM gateway (optional).
 web:               # Admin web UI (optional).
+health:            # k8s liveness/readiness listener (defaults on).
 retry:             # Default retry policy for every task (optional).
 event_buffer_size: # Per-edge channel capacity (optional).
 telemetry:         # OpenTelemetry export (optional).
@@ -74,6 +75,10 @@ web:
   port: 8080
   path: /flowgen
 
+health:
+  enabled: true
+  port: 8081
+
 retry:
   max_attempts: 10
   initial_backoff: "1s"
@@ -82,7 +87,9 @@ event_buffer_size: 10000
 
 telemetry:
   enabled: true
-  otlp_endpoint: http://localhost:4317
+  backend:
+    type: remote
+    endpoint: http://otel-collector:4317
   service_name: flowgen
   metrics_export_interval: "60s"
 ```
@@ -111,10 +118,10 @@ Distributed cache backend. When omitted, flowgen uses an in-memory cache (single
 |---|---|---|---|
 | `enabled` | bool | required | Set `false` to fall back to in-memory cache. |
 | `type` | string | required | Backend type. Currently `nats`. |
-| `credentials_path` | string | required | Path to NATS credentials file. |
+| `credentials_path` | string | optional | Path to NATS credentials file. |
 | `url` | string | `localhost:4222` | NATS server URL. |
 | `db_name` | string | `flowgen_cache` | KV bucket name. |
-| `history` | int | `10` | Historical entries retained per key. Only applies when the bucket is created. |
+| `history` | int | `64` | Historical entries retained per key. Only applies when the bucket is created. Server caps at 64. |
 | `tombstone_ttl` | duration | `1h` | TTL for delete/purge tombstones. Required for per-key TTLs on cache entries to work. |
 
 If NATS is configured but unreachable, flowgen falls back to in-memory automatically and logs a warning. See [Caching](/docs/flowgen/concepts/caching).
@@ -201,16 +208,20 @@ The default (10,000) is sufficient for most workloads. The buffer only needs to 
 
 ## `telemetry`
 
-OpenTelemetry export over OTLP/gRPC. See [Telemetry](/docs/flowgen/concepts/telemetry).
+OpenTelemetry providers for metrics, traces, and logs. See [Telemetry](/docs/flowgen/concepts/telemetry).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | required | Set `true` to start the OTLP exporter. |
-| `otlp_endpoint` | string | `http://localhost:4317` | OTLP/gRPC endpoint. |
+| `enabled` | bool | required | Set `true` to initialize the provider. |
+| `backend` | object | in-memory | Backend selection. Omit for the in-memory backend. |
+| `backend.type` | string | — | Either `memory` or `remote`. |
+| `backend.endpoint` | string | — | Required for `remote`. gRPC endpoint of the collector. |
+| `backend.logs_per_flow` | usize | `1000` | Memory backend only. Log records retained per flow. |
+| `backend.metrics_per_flow` | usize | `1000` | Memory backend only. Metric samples retained per flow. |
 | `service_name` | string | `flowgen` | `service.name` resource attribute. |
-| `metrics_export_interval` | duration | `60s` | How often metric snapshots are pushed. |
+| `metrics_export_interval` | duration | `60s` | How often metric snapshots are pushed. Ignored by the memory backend. |
 
-When `telemetry` is omitted entirely, no OTLP exporter starts but tracing logs still go to stderr.
+When `telemetry` is omitted entirely, no telemetry stack is started.
 
 ## Running
 

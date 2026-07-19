@@ -1,5 +1,158 @@
 # Changelog
 
+## 0.125.0
+
+### Breaking
+
+- **Kubernetes probes moved to a dedicated port.** The helm chart
+  (v0.19.0) points `livenessProbe` at `/livez` and `readinessProbe`
+  at `/readyz` on a new `health` port (default 8081), instead of
+  `/healthz` on the API port. Pins that override `livenessProbe` or
+  `readinessProbe` in `values.yaml` need to be updated. Anything
+  hardcoding `/healthz` on port 3000 in external tooling (ingress
+  health checks, external monitors) needs to switch to `/livez` on
+  port 8081. `/healthz` is preserved as an alias of `/livez` on the
+  new listener for pre-1.16 k8s convention.
+
+- **`telemetry.otlp_endpoint` replaced by `telemetry.backend`.** The
+  telemetry section now selects between an in-process backend and a
+  remote OTLP collector through a tagged `backend` block. Existing
+  configs that set `enabled: true` with no other fields still work
+  (they fall back to the in-memory backend). To keep pushing to a
+  collector, replace:
+
+  ```yaml
+  telemetry:
+    enabled: true
+    otlp_endpoint: "http://otel-collector:4317"
+  ```
+
+  with:
+
+  ```yaml
+  telemetry:
+    enabled: true
+    backend:
+      type: remote
+      endpoint: "http://otel-collector:4317"
+  ```
+
+### Features
+
+- **Dedicated k8s health listener at `flowgen_core::health`.** Spawns
+  its own axum listener on `health.port` (default 8081), independent
+  of the API listeners. Exposes `GET /livez` (always 200), `GET
+  /readyz` (200 once at least one flow is registered, 503 before),
+  and `GET /healthz` as an alias for `/livez`. Probes keep working
+  regardless of which API surfaces (`http_server`, `mcp_server`,
+  `ai_gateway`, `web`) are enabled. Set `health.enabled: false` to
+  disable the listener entirely.
+
+- **JSON stdout logs consumable by the admin UI.** Logs continue to be
+  written as JSON via `tracing_subscriber::fmt::json()`. In `memory`
+  backend mode a copy of that stream is parsed into an in-process
+  per-flow ring buffer (default 1000 entries per flow, configurable
+  via `backend.logs_per_flow`) exposed through the `LogsQuery` trait
+  the admin UI reads. In `remote` mode logs stay on stdout only —
+  operators plug in Fluent Bit / Vector / Grafana Alloy to forward
+  them to Loki, VictoriaLogs, Elasticsearch, or wherever.
+
+- **Backend-agnostic `LogsQuery` trait.** The web layer no longer
+  knows what backend serves its activity view; a memory
+  implementation ships today, remote backends (Loki, VictoriaLogs)
+  land in follow-up work through backend-specific crates.
+
+- **`telemetry.backend` tagged enum with per-backend fields.** The
+  `memory` variant accepts `logs_per_flow` and `metrics_per_flow`;
+  the `remote` variant accepts `endpoint`. Invalid combinations fail
+  at parse time.
+
+- **Per-invocation `task.handle` span on source tasks.** NATS
+  JetStream subscribers, Salesforce Pub/Sub subscribers, HTTP
+  endpoints, MCP handlers, the AI gateway LLM proxy, `git_sync`,
+  `oci_sync`, and `buffer` flushes now emit a `task.handle` span per
+  message / request / tick. The DAG duration badge and the activity
+  panel show live per-invocation timing for these tasks instead of
+  `—`.
+
+- **`duration_ms` backfilled onto every `task.handle` span.** The
+  activity layer records the elapsed wall-clock on the current
+  `task.handle` span via a `field::Empty` placeholder declared on
+  the `#[instrument]` macro. `tracing_subscriber::fmt::json()` then
+  includes it in the emitted `spans` array, so downstream consumers
+  (admin UI, log shippers, OTel span exporters) all see the same
+  per-event duration.
+
+- **Admin activity panel renders structured attributes.** Custom
+  tracing fields beyond the known system attributes (flow, task,
+  level, timestamp, event.id, duration_ms) now surface as a
+  key/value list under the message in the drawer. Context fields
+  attached via `EventLogger::context()` are serialized as a JSON
+  object so consumers can split them back into individual
+  attributes rather than parsing a joined string.
+
+- **Copy full log JSON from the activity drawer.** The drawer's
+  copy button now serializes the entire selected record — message,
+  timestamps, level, flow/task/processor, event id, duration, and
+  every extra attribute — into one JSON blob suitable for pasting
+  into tickets or chat.
+
+- **Explicit `activity = true` marker on every `task.handle` span.**
+  The admin activity feed filters on this marker so lifecycle logs
+  emitted from `task.run` scope (endpoint registration, resource
+  registration, startup traces) stay in stdout but do not clutter
+  the per-event UI. Errors and warnings that arise in the same
+  scope still surface — the marker only filters info-level noise.
+
+- **NATS `credentials_path` is now optional.** The `cache`,
+  `nats_kv_store`, `nats_jetstream_subscriber`, and
+  `nats_jetstream_publisher` config sections accept an omitted
+  `credentials_path`. When omitted, flowgen sends no credentials on
+  connect — the connection then succeeds only against a NATS server
+  that does not require authentication.
+
+- **Integration test coverage for NATS.** The `flowgen_nats` crate
+  gains `cache_integration`, `jetstream_integration`, and
+  `kv_store_integration` test suites that spin up a real NATS
+  JetStream server via testcontainers and exercise every method on
+  the `Cache` trait plus the publisher / subscriber / KV-store
+  processors. `flowgen` adds `init_cache_regression` covering the
+  unified `App::init_cache` code path against a real broker. All
+  integration tests are `#[ignore]`-gated and run in the
+  `test-integration` CI job with a single
+  `cargo test --workspace --tests -- --ignored` invocation.
+
+### Fixes
+
+- **k8s probes no longer 404.** During the earlier HTTP server
+  refactor from `flowgen_http::server` into
+  `flowgen_core::http_server` the previous `/healthz` handler was
+  lost, silently — probes returned 404 and pods crashlooped as soon
+  as the readiness `failureThreshold` was reached. Replaced with the
+  dedicated health listener above so the regression cannot recur:
+  even a service with every API listener disabled still answers
+  probes.
+
+- **`init_cache` unified between system + user cache paths.** The two
+  cache init call sites in `App` previously diverged on the
+  `history` / `tombstone_ttl` overrides. Both paths now go through a
+  single `App::init_cache` so per-tenant history overrides
+  (e.g. NATS KV's server-side cap of 64) apply uniformly and the
+  system cache no longer races with the runtime cache during
+  bootstrap.
+
+- **Default KV history dropped from 1000 → 64.** The NATS KV server
+  hard-caps per-subject history at 64; the previous default caused
+  `too long history` errors on real deploys. Callers that want fewer
+  retained versions can still lower the value via `cache.history`.
+
+- **`Cache::delete_with_revision` returns `RevisionMismatch` on
+  stale revisions.** The NATS backend used to fold every underlying
+  `UpdateError` into the generic `DeleteFailed` variant, so lease
+  release code that pattern-matched on `RevisionMismatch` never
+  detected loss of ownership. Mapping now mirrors what
+  `Cache::update` already did.
+
 ## 0.124.0
 
 ### Breaking

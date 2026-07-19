@@ -8,13 +8,15 @@
 # When disabled, falls back to in-memory cache (suitable for single-instance deployments only).
 cache:
   enabled: true
-  credentials_path: "path_to_credentials"
   url: "url_of_cache"
   db_name: "cache_db_name"
   type: nats
-  # Optional: number of historical entries retained per key (defaults to 1000).
-  # Only applies when the KV bucket is first created.
-  # history: 1000
+  # Optional path to a NATS credentials file.
+  # credentials_path: "/etc/nats/credentials.json"
+  # Optional: number of historical entries retained per key (defaults to 64,
+  # the NATS server-side cap for KV buckets). Only applies when the KV bucket
+  # is first created.
+  # history: 64
   # Optional: TTL for KV delete/purge tombstone markers (defaults to 1h).
   # Must be set for per-key TTLs on cache entries to work at all.
   # Only applies when the KV bucket is first created.
@@ -39,12 +41,21 @@ flows:
 resources:
   path: "path_to_resources_folder"
 
-# OpenTelemetry configuration for metrics and distributed tracing (optional).
-# Exports metrics and traces to an OTLP endpoint (e.g., OpenTelemetry Collector, Grafana Cloud, Honeycomb).
+# OpenTelemetry configuration for metrics, traces, and logs (optional).
+# When enabled without a backend, signals stay in-process (memory backend).
+# When configured with the otlp backend, signals ship to any OTLP-compatible
+# collector (OpenTelemetry Collector, Grafana Cloud, Honeycomb, Datadog, etc.).
 telemetry:
   enabled: false
-  # Optional: OTLP endpoint (defaults to "http://localhost:4317").
-  # otlp_endpoint: "http://localhost:4317"
+  # Optional: backend selection.
+  # backend:
+  #   type: remote
+  #   endpoint: "http://otel-collector:4317"
+  # Or, for the in-memory backend (demo / single-node dev):
+  # backend:
+  #   type: memory
+  #   logs_per_flow: 1000
+  #   metrics_per_flow: 1000
   # Optional: service name (defaults to "flowgen").
   # service_name: "flowgen"
   # Optional: metrics export interval using human-readable format (defaults to "60s").
@@ -116,6 +127,14 @@ http_server:
 #   enabled: true
 #   port: 8080
 #   path: "/flowgen"
+
+# Kubernetes liveness/readiness listener. Independent from the API
+# listeners so probes keep working regardless of which surfaces are
+# enabled. Endpoints: /livez, /readyz, /healthz (alias of /livez).
+# Defaults to enabled on port 8081. Set enabled: false to skip.
+# health:
+#   enabled: true
+#   port: 8081
 
 # Event channel buffer size (optional, defaults to 10,000).
 # Capacity of each inter-task event channel (in events). When full the

@@ -125,6 +125,14 @@ where
             }
         }
 
+        // Backfill the `duration_ms` field on the `task.handle` span so
+        // the JSON formatter includes it in the emitted line's `spans`
+        // array. The field is declared as `field::Empty` on every
+        // `task.handle` instrument macro.
+        if let Some(ms) = duration_ms {
+            tracing::Span::current().record("duration_ms", ms);
+        }
+
         let Some(flow) = flow else {
             return;
         };
@@ -308,9 +316,7 @@ mod tests {
 
     #[test]
     fn captures_events_under_flow_and_task_handle_scopes() {
-        let reg = FlowRegistry::builder()
-            .cache(Arc::new(crate::cache::MemoryCache::new()))
-            .build();
+        let reg = FlowRegistry::builder().build();
         let _g = install(Arc::clone(&reg));
 
         // Simulate the flow.run > task.run > task.handle > event stack.
@@ -333,9 +339,7 @@ mod tests {
 
     #[test]
     fn ignores_info_outside_task_handle_scope() {
-        let reg = FlowRegistry::builder()
-            .cache(Arc::new(crate::cache::MemoryCache::new()))
-            .build();
+        let reg = FlowRegistry::builder().build();
         let _g = install(Arc::clone(&reg));
         let flow_span = info_span!("flow.run", flow = "demo");
         let _flow = flow_span.enter();
@@ -347,9 +351,7 @@ mod tests {
 
     #[test]
     fn counts_info_with_event_subject_outside_task_handle() {
-        let reg = FlowRegistry::builder()
-            .cache(Arc::new(crate::cache::MemoryCache::new()))
-            .build();
+        let reg = FlowRegistry::builder().build();
         let _g = install(Arc::clone(&reg));
         let flow_span = info_span!("flow.run", flow = "demo");
         let _flow = flow_span.enter();
@@ -364,9 +366,7 @@ mod tests {
 
     #[test]
     fn counts_init_errors_on_task_run_span() {
-        let reg = FlowRegistry::builder()
-            .cache(Arc::new(crate::cache::MemoryCache::new()))
-            .build();
+        let reg = FlowRegistry::builder().build();
         let _g = install(Arc::clone(&reg));
         let flow_span = info_span!("flow.run", flow = "demo");
         let _flow = flow_span.enter();
@@ -383,9 +383,7 @@ mod tests {
 
     #[test]
     fn ignores_events_outside_any_flow_scope() {
-        let reg = FlowRegistry::builder()
-            .cache(Arc::new(crate::cache::MemoryCache::new()))
-            .build();
+        let reg = FlowRegistry::builder().build();
         let _g = install(Arc::clone(&reg));
         // Ambient info!() outside flow.run should be silently dropped.
         info!("boot message");

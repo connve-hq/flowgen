@@ -19,7 +19,7 @@ exclude = [".cargo"]
 allow_attributes = "deny"
 
 [workspace.package]
-version = "0.124.0"
+version = "0.125.0"
 authors = ["CONNVE"]
 license = "MPL-2.0"
 edition = "2021"
@@ -54,7 +54,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 serde_yaml = { version = "0.9" }
 tokio = { version = "1.48", features = ["rt-multi-thread"] }
-tokio-stream = { version = "0.1" }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 thiserror = { version = "1.0" }
 tiberius = { version = "0.12", features = ["chrono"] }

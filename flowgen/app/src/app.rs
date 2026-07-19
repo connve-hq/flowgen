@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
-use tracing::{debug, error, info, warn, Instrument};
+use tracing::{error, info, warn, Instrument};
 
 /// Tracks a running flow.
 ///
@@ -276,14 +276,19 @@ pub struct App {
     /// state. Built in `main` before tracing so `FlowRegistry` can be
     /// constructed with a real cache reference from the outset.
     pub cache: Arc<dyn flowgen_core::cache::Cache>,
+    /// Backend-agnostic log query source used by the admin web API for
+    /// history queries and SSE tail. `None` when the selected telemetry
+    /// backend does not (yet) expose a query surface.
+    pub logs_query: Option<Arc<dyn flowgen_core::telemetry::query::LogsQuery>>,
 }
 
 impl App {
     /// Builds the runtime cache from config (NATS if enabled and reachable,
     /// otherwise in-memory). Callable before tracing is up so `main` can
     /// hand a real cache to `FlowRegistry::builder().cache(...)`.
-    pub async fn build_cache(
+    pub async fn init_cache(
         app_config: &AppConfig,
+        db_name: Option<&str>,
     ) -> Result<Arc<dyn flowgen_core::cache::Cache>, Error> {
         let Some(cache_config) = &app_config.cache else {
             return Ok(Arc::new(flowgen_core::cache::memory::MemoryCache::new()));
@@ -291,13 +296,17 @@ impl App {
         if !cache_config.enabled {
             return Ok(Arc::new(flowgen_core::cache::memory::MemoryCache::new()));
         }
-        let db_name = cache_config
-            .db_name
-            .as_deref()
-            .unwrap_or(crate::config::DEFAULT_CACHE_DB_NAME);
-        let mut cache_builder = flowgen_nats::cache::CacheBuilder::new()
-            .credentials_path(cache_config.credentials_path.clone())
-            .url(cache_config.url.clone());
+        let db_name = db_name.unwrap_or_else(|| {
+            cache_config
+                .db_name
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_CACHE_DB_NAME)
+        });
+        let mut cache_builder =
+            flowgen_nats::cache::CacheBuilder::new().url(cache_config.url.clone());
+        if let Some(path) = cache_config.credentials_path.clone() {
+            cache_builder = cache_builder.credentials_path(path);
+        }
         if let Some(history) = cache_config.history {
             cache_builder = cache_builder.history(history);
         }
@@ -311,24 +320,6 @@ impl App {
             },
             Err(e) => Err(Error::SystemCacheInit { source: e }),
         }
-    }
-
-    /// Initializes a system cache connection for flow/resource loading.
-    /// Separate from the runtime cache to avoid key collisions during list operations.
-    fn init_system_cache(
-        app_config: &AppConfig,
-        db_name: &str,
-    ) -> Result<Arc<dyn flowgen_core::cache::Cache>, Error> {
-        let cache_config = app_config.cache.as_ref().ok_or(Error::InvalidFlowsPath)?;
-
-        let nats_cache = flowgen_nats::cache::CacheBuilder::new()
-            .credentials_path(cache_config.credentials_path.clone())
-            .url(cache_config.url.clone())
-            .build()
-            .and_then(|builder| futures::executor::block_on(async { builder.init(db_name).await }))
-            .map_err(|source| Error::SystemCacheInit { source })?;
-
-        Ok(Arc::new(nats_cache))
     }
 
     /// Loads flow configurations from a system cache bucket.
@@ -536,34 +527,6 @@ impl App {
     pub async fn start(self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), Error> {
         let app_config = Arc::new(self.config);
 
-        // Initialize OpenTelemetry if configured.
-        let _telemetry_guard = if let Some(telemetry_config) = &app_config.telemetry {
-            if telemetry_config.enabled {
-                let config = flowgen_core::telemetry::TelemetryConfig {
-                    otlp_endpoint: telemetry_config.otlp_endpoint.clone(),
-                    service_name: telemetry_config.service_name.clone(),
-                    service_version: env!("CARGO_PKG_VERSION").to_string(),
-                    metrics_export_interval_secs: telemetry_config
-                        .metrics_export_interval
-                        .as_secs(),
-                };
-                match flowgen_core::telemetry::init_telemetry(config) {
-                    Ok(guard) => {
-                        debug!("OpenTelemetry initialized successfully");
-                        Some(guard)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to initialize OpenTelemetry, continuing without metrics");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // Load flows from filesystem and (optionally) from the distributed cache.
         // The two sources are merged so a worker can run any combination of:
         //   - filesystem only (no cache section, classic mode);
@@ -578,7 +541,7 @@ impl App {
 
         let (cache_flows, system_cache) = match app_config.flows.cache.as_ref() {
             Some(cache_opts) if cache_opts.enabled => {
-                match Self::init_system_cache(&app_config, &cache_opts.db_name) {
+                match Self::init_cache(&app_config, Some(&cache_opts.db_name)).await {
                     Ok(cache) => {
                         info!(
                             "Initialized system cache for flow loading on bucket '{}'.",
@@ -792,7 +755,7 @@ impl App {
                         {
                             system_cache.as_ref().map(|(c, _)| c.clone())
                         } else {
-                            match Self::init_system_cache(&app_config, &rc.db_name) {
+                            match Self::init_cache(&app_config, Some(&rc.db_name)).await {
                                 Ok(cache) => {
                                     info!(
                                         "Initialized system cache for resource loading on bucket '{}'.",
@@ -1093,7 +1056,7 @@ impl App {
                 prefix: String::new(),
                 resource_loader: resource_loader.clone(),
                 flow_activity: Arc::clone(&self.flow_activity),
-                cache: Arc::clone(&cache),
+                logs_query: self.logs_query.clone(),
             };
             let web_handle = tokio::spawn(async move {
                 if let Err(source) = crate::web::start_web_server(port, &path, web_state).await {
@@ -1101,6 +1064,26 @@ impl App {
                 }
             });
             background_handles.push(web_handle);
+        }
+
+        // Start the dedicated k8s health listener. Readiness reports true once
+        // at least one flow is registered; liveness is always 200.
+        if app_config.health.enabled {
+            let port = app_config.health.port;
+            let registry_for_health = Arc::clone(&flow_registry);
+            let readiness: flowgen_core::health::ReadinessCheck =
+                Arc::new(move || match registry_for_health.read() {
+                    Ok(guard) => !guard.is_empty(),
+                    Err(_) => false,
+                });
+            let health_handle = tokio::spawn(async move {
+                if let Err(source) =
+                    flowgen_core::health::start_health_server(port, readiness).await
+                {
+                    error!("{}", source);
+                }
+            });
+            background_handles.push(health_handle);
         }
 
         // Spawn the hot-reload watcher and reconciler if the system cache supports watching.

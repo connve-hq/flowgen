@@ -98,6 +98,13 @@ flowgen:
   #   type: ClusterIP
   #   port: 8080
 
+  # Kubernetes liveness/readiness listener. Independent from the API
+  # listeners so probes keep working regardless of which surfaces are
+  # enabled. Endpoints: /livez (always 200), /readyz (200 once >=1 flow
+  # is registered), /healthz (alias of /livez for pre-1.16 convention).
+  health:
+    port: 8081
+
   serviceAccount:
     # Specifies whether a service account should be created
     create: true
@@ -123,7 +130,9 @@ flowgen:
     #       path: "/etc/app/resources"
     #     telemetry:
     #       enabled: true
-    #       otlp_endpoint: "http://otel-collector:4317"
+    #       backend:
+    #         type: remote
+    #         endpoint: "http://otel-collector:4317"
     #       service_name: "flowgen"
     #       metrics_export_interval: "60s"
     inline: ""

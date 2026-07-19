@@ -313,6 +313,12 @@ pub struct AppConfig {
     pub ai_gateway: Option<AiGatewayOptions>,
     /// Optional admin web UI configuration for inspecting loaded flows.
     pub web: Option<WebOptions>,
+    /// Kubernetes-facing liveness/readiness listener. Independent of the
+    /// API listeners so probes keep working regardless of which surfaces
+    /// (http_server / mcp_server / ai_gateway / web) are enabled.
+    /// Defaults to enabled on port 8081 if omitted.
+    #[serde(default)]
+    pub health: HealthOptions,
     /// Optional app-level retry configuration (can be overridden per task).
     pub retry: Option<flowgen_core::retry::RetryConfig>,
     /// Per-edge event channel capacity in events (defaults to 10,000).
@@ -338,8 +344,9 @@ pub struct CacheOptions {
     /// Cache backend type.
     #[serde(rename = "type")]
     pub cache_type: CacheType,
-    /// Path to cache credentials file.
-    pub credentials_path: PathBuf,
+    /// Optional path to cache credentials file.
+    #[serde(default)]
+    pub credentials_path: Option<PathBuf>,
     /// NATS server URL (e.g., "nats://localhost:4222"). Defaults to "localhost:4222".
     #[serde(default = "default_nats_url")]
     pub url: String,
@@ -566,6 +573,35 @@ pub struct WebOptions {
     pub path: String,
 }
 
+/// Default health listener port.
+fn default_health_port() -> u16 {
+    8081
+}
+
+/// Default `enabled: true` for HealthOptions when the field is omitted.
+fn default_health_enabled() -> bool {
+    true
+}
+
+/// Kubernetes liveness/readiness listener configuration.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HealthOptions {
+    /// Whether the health listener is enabled. Defaults to true.
+    pub enabled: bool,
+    /// Health listener port. Defaults to 8081.
+    pub port: u16,
+}
+
+impl Default for HealthOptions {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            port: default_health_port(),
+        }
+    }
+}
+
 /// Default webhook HTTP server port.
 fn default_http_port() -> u16 {
     3000
@@ -595,14 +631,19 @@ pub struct HttpServerOptions {
     pub auth: Option<flowgen_core::auth::AuthConfig>,
 }
 
-/// OpenTelemetry configuration options for metrics and distributed tracing.
+/// OpenTelemetry configuration for metrics, tracing, and log export.
+///
+/// When `enabled` is false the runtime skips telemetry entirely. When
+/// enabled without a `backend` block the runtime falls back to the
+/// in-memory backend, so `enabled: true` with no other fields is a
+/// valid standalone configuration.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct TelemetryOptions {
     /// Whether OpenTelemetry is enabled.
     pub enabled: bool,
-    /// OTLP endpoint for exporting metrics and traces (defaults to "http://localhost:4317").
-    #[serde(default = "default_otlp_endpoint")]
-    pub otlp_endpoint: String,
+    /// Backend selection. Omitted means in-memory.
+    #[serde(default)]
+    pub backend: Option<TelemetryBackendOptions>,
     /// Service name for resource identification (defaults to "flowgen").
     #[serde(default = "default_service_name")]
     pub service_name: String,
@@ -612,8 +653,32 @@ pub struct TelemetryOptions {
     pub metrics_export_interval: Duration,
 }
 
-fn default_otlp_endpoint() -> String {
-    "http://localhost:4317".to_string()
+/// User-facing backend selection.
+///
+/// Serialized as a tagged enum. Each variant carries only the fields
+/// that make sense for that backend, so an invalid combination
+/// (e.g. `logs_per_flow` on the `remote` backend) fails at parse time.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TelemetryBackendOptions {
+    /// Keep all signals in-process behind bounded per-flow ring buffers.
+    /// Intended for demo and single-node dev; multi-replica deploys
+    /// should use `remote` instead.
+    Memory {
+        /// Log records retained per flow before oldest entries are
+        /// dropped. Defaults to 1000.
+        #[serde(default = "default_logs_per_flow")]
+        logs_per_flow: usize,
+        /// Metric samples retained per flow before oldest entries are
+        /// dropped. Defaults to 1000.
+        #[serde(default = "default_metrics_per_flow")]
+        metrics_per_flow: usize,
+    },
+    /// Push all signals over OTLP/gRPC to a remote collector.
+    Remote {
+        /// gRPC endpoint of the collector (e.g. "http://otel-collector:4317").
+        endpoint: String,
+    },
 }
 
 fn default_service_name() -> String {
@@ -622,6 +687,14 @@ fn default_service_name() -> String {
 
 fn default_metrics_interval() -> Duration {
     Duration::from_secs(60)
+}
+
+fn default_logs_per_flow() -> usize {
+    1000
+}
+
+fn default_metrics_per_flow() -> usize {
+    1000
 }
 
 #[cfg(test)]
@@ -758,7 +831,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: true,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/test/cache"),
+                credentials_path: Some(PathBuf::from("/test/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
                 history: None,
@@ -773,6 +846,7 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: None,
@@ -801,6 +875,7 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: None,
@@ -816,7 +891,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: false,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/serialize/cache"),
+                credentials_path: Some(PathBuf::from("/serialize/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: Some("test_db".to_string()),
                 history: None,
@@ -831,6 +906,7 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: None,
@@ -847,7 +923,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: true,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/clone/cache"),
+                credentials_path: Some(PathBuf::from("/clone/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
                 history: None,
@@ -862,6 +938,7 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: None,
@@ -876,7 +953,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: true,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/test/credentials_path"),
+            credentials_path: Some(PathBuf::from("/test/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
             history: None,
@@ -886,7 +963,7 @@ mod tests {
         assert!(cache_options.enabled);
         assert_eq!(
             cache_options.credentials_path,
-            PathBuf::from("/test/credentials_path")
+            Some(PathBuf::from("/test/credentials_path"))
         );
     }
 
@@ -895,7 +972,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: false,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/disabled/cache"),
+            credentials_path: Some(PathBuf::from("/disabled/cache")),
             url: "localhost:4222".to_string(),
             db_name: Some("custom_db".to_string()),
             history: None,
@@ -905,7 +982,7 @@ mod tests {
         assert!(!cache_options.enabled);
         assert_eq!(
             cache_options.credentials_path,
-            PathBuf::from("/disabled/cache")
+            Some(PathBuf::from("/disabled/cache"))
         );
     }
 
@@ -914,7 +991,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: true,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/serialize/credentials_path"),
+            credentials_path: Some(PathBuf::from("/serialize/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
             history: None,
@@ -1042,6 +1119,7 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: None,
@@ -1055,19 +1133,21 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_options_creation() {
+    fn test_telemetry_options_remote_backend() {
         let telemetry_options = TelemetryOptions {
             enabled: true,
-            otlp_endpoint: "http://otel-collector:4317".to_string(),
+            backend: Some(TelemetryBackendOptions::Remote {
+                endpoint: "http://otel-collector:4317".to_string(),
+            }),
             service_name: "flowgen".to_string(),
             metrics_export_interval: Duration::from_secs(30),
         };
 
         assert!(telemetry_options.enabled);
-        assert_eq!(
-            telemetry_options.otlp_endpoint,
-            "http://otel-collector:4317"
-        );
+        assert!(matches!(
+            &telemetry_options.backend,
+            Some(TelemetryBackendOptions::Remote { endpoint }) if endpoint == "http://otel-collector:4317"
+        ));
         assert_eq!(telemetry_options.service_name, "flowgen");
         assert_eq!(
             telemetry_options.metrics_export_interval,
@@ -1076,15 +1156,16 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_options_default_values() {
+    fn test_telemetry_options_defaults_to_no_backend() {
         let telemetry_options = TelemetryOptions {
-            enabled: false,
-            otlp_endpoint: "http://localhost:4317".to_string(),
+            enabled: true,
+            backend: None,
             service_name: default_service_name(),
             metrics_export_interval: default_metrics_interval(),
         };
 
-        assert!(!telemetry_options.enabled);
+        assert!(telemetry_options.enabled);
+        assert!(telemetry_options.backend.is_none());
         assert_eq!(telemetry_options.service_name, "flowgen");
         assert_eq!(
             telemetry_options.metrics_export_interval,
@@ -1093,10 +1174,12 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_options_serialization() {
+    fn test_telemetry_options_serialization_roundtrip() {
         let telemetry_options = TelemetryOptions {
             enabled: true,
-            otlp_endpoint: "http://grafana:4317".to_string(),
+            backend: Some(TelemetryBackendOptions::Remote {
+                endpoint: "http://grafana:4317".to_string(),
+            }),
             service_name: "flowgen-prod".to_string(),
             metrics_export_interval: Duration::from_secs(120),
         };
@@ -1104,6 +1187,36 @@ mod tests {
         let serialized = serde_json::to_string(&telemetry_options).unwrap();
         let deserialized: TelemetryOptions = serde_json::from_str(&serialized).unwrap();
         assert_eq!(telemetry_options, deserialized);
+    }
+
+    #[test]
+    fn test_telemetry_backend_tagged_enum_yaml() {
+        let yaml_remote = "type: remote\nendpoint: http://otel:4317\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_remote).unwrap();
+        assert!(matches!(
+            &parsed,
+            TelemetryBackendOptions::Remote { endpoint } if endpoint == "http://otel:4317"
+        ));
+
+        let yaml_memory = "type: memory\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_memory).unwrap();
+        assert!(matches!(
+            parsed,
+            TelemetryBackendOptions::Memory {
+                logs_per_flow: 1000,
+                metrics_per_flow: 1000,
+            }
+        ));
+
+        let yaml_memory_custom = "type: memory\nlogs_per_flow: 250\nmetrics_per_flow: 500\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_memory_custom).unwrap();
+        assert!(matches!(
+            parsed,
+            TelemetryBackendOptions::Memory {
+                logs_per_flow: 250,
+                metrics_per_flow: 500,
+            }
+        ));
     }
 
     #[test]
@@ -1119,11 +1232,14 @@ mod tests {
             mcp_server: None,
             ai_gateway: None,
             web: None,
+            health: Default::default(),
             retry: None,
             event_buffer_size: None,
             telemetry: Some(TelemetryOptions {
                 enabled: true,
-                otlp_endpoint: "http://otel-collector:4317".to_string(),
+                backend: Some(TelemetryBackendOptions::Remote {
+                    endpoint: "http://otel-collector:4317".to_string(),
+                }),
                 service_name: "flowgen".to_string(),
                 metrics_export_interval: Duration::from_secs(60),
             }),
@@ -1132,7 +1248,10 @@ mod tests {
         assert!(app_config.telemetry.is_some());
         let telemetry = app_config.telemetry.as_ref().unwrap();
         assert!(telemetry.enabled);
-        assert_eq!(telemetry.otlp_endpoint, "http://otel-collector:4317");
+        assert!(matches!(
+            &telemetry.backend,
+            Some(TelemetryBackendOptions::Remote { endpoint }) if endpoint == "http://otel-collector:4317"
+        ));
         assert_eq!(telemetry.service_name, "flowgen");
         assert_eq!(telemetry.metrics_export_interval, Duration::from_secs(60));
     }
