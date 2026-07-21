@@ -587,9 +587,19 @@ pub struct Flow {
 }
 
 impl Flow {
-    /// Returns the name of the flow.
+    /// Returns the flow identity — the loader-assigned `source_path` when
+    /// present (filesystem/cache load), otherwise the programmatic
+    /// `flow.name`. Same value as `identity()`; kept as `name()` for
+    /// existing call sites that predate the path-as-identity refactor.
     pub fn name(&self) -> &str {
-        &self.config.flow.name
+        self.identity()
+    }
+
+    /// Returns the flow identity — used as the tracing `flow=` field, the
+    /// registry key, and the cache namespace so activity keys line up with
+    /// the admin API.
+    pub fn identity(&self) -> &str {
+        self.config.identity()
     }
 
     /// Returns a reference to the task manager if initialized.
@@ -629,7 +639,7 @@ impl Flow {
             if self.config.flow.require_leader_election.unwrap_or(false) {
                 info!(
                     "Flow {} contains a blocking task (webhook, MCP registration, or llm_proxy); `required_leader_election` flag will be ignored.",
-                    self.config.flow.name
+                    self.identity()
                 );
             }
             return false; // Flows with blocking tasks are never leader elected.
@@ -703,8 +713,13 @@ impl Flow {
         // Shared response registry for streaming progress between tasks in this flow.
         let response_registry = Arc::new(flowgen_core::registry::ResponseRegistry::new());
 
+        let source_path = match self.config.identity_variant() {
+            crate::config::FlowIdentity::Path(p) => Some(p.clone()),
+            crate::config::FlowIdentity::Name(_) => None,
+        };
         let mut task_context_builder = flowgen_core::task::context::TaskContextBuilder::new()
-            .flow_name(self.config.flow.name.clone())
+            .flow_name(self.identity().to_string())
+            .source_path(source_path)
             .flow_labels(self.config.flow.labels.clone())
             .task_manager(task_manager)
             .cache(Arc::clone(&self.cache))
@@ -861,7 +876,7 @@ impl Flow {
     /// Returns blocking handles (webhook registrations) that must complete
     /// before the HTTP server starts. Background handles are stored for
     /// `monitor_tasks()` to monitor.
-    #[tracing::instrument(skip(self), name = "flow.run", fields(flow = %self.config.flow.name))]
+    #[tracing::instrument(skip(self), name = "flow.run", fields(flow = %self.identity()))]
     pub async fn start_tasks(&self) -> Result<Vec<JoinHandle<Result<(), Error>>>, Error> {
         if self.is_leader_elected() {
             return Ok(Vec::new());
@@ -890,13 +905,13 @@ impl Flow {
     ///
     /// This spawns a single master task that manages the flow's lifecycle,
     /// including leader election and running all background tasks.
-    #[tracing::instrument(skip(self), name = "flow.run", fields(flow = %self.config.flow.name))]
+    #[tracing::instrument(skip(self), name = "flow.run", fields(flow = %self.identity()))]
     pub fn run(self) -> JoinHandle<()> {
-        let flow_name = self.config.flow.name.clone();
+        let flow_id = self.identity().to_string();
         tokio::spawn(
             async move {
                 if let Err(e) = self.monitor_tasks().await {
-                    error!("Flow {} terminated with an error: {}", flow_name, e);
+                    error!("Flow {} terminated with an error: {}", flow_id, e);
                 }
             }
             .instrument(tracing::Span::current()),
@@ -914,7 +929,7 @@ impl Flow {
             .as_ref()
             .ok_or_else(|| Error::TaskManagerNotInitialized)?
             .clone();
-        let flow_id = self.config.flow.name.clone();
+        let flow_id = self.identity().to_string();
 
         let leader_election_options = if is_leader_elected {
             Some(flowgen_core::task::manager::LeaderElectionOptions {})
@@ -997,7 +1012,8 @@ impl Flow {
             } else {
                 info!(
                     "Spawning {} parallel instances for flow: {}",
-                    parallel_instances, self.config.flow.name
+                    parallel_instances,
+                    self.identity()
                 );
                 self.spawn_parallel_instances(parallel_instances).await?
             }
@@ -2068,7 +2084,7 @@ impl FlowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Flow, FlowConfig};
+    use crate::config::{Flow, FlowConfig, FlowConfigRaw};
 
     #[test]
     fn test_flow_builder_new() {
@@ -2086,16 +2102,21 @@ mod tests {
 
     #[test]
     fn test_flow_builder_config() {
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let builder = FlowBuilder::new().config(flow_config.clone());
         assert_eq!(builder.config, Some(flow_config));
@@ -2130,16 +2151,21 @@ mod tests {
 
     #[test]
     fn test_flow_builder_build_without_http_server() {
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
         let cache = Arc::new(flowgen_core::cache::memory::MemoryCache::new())
             as Arc<dyn flowgen_core::cache::Cache>;
 
@@ -2156,16 +2182,21 @@ mod tests {
 
     #[test]
     fn test_flow_builder_build_success() {
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "success_flow".to_string(),
-                labels: None,
-                tasks: vec![],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("success_flow".to_string()),
+                        labels: None,
+                        tasks: vec![],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
         let server = Arc::new(flowgen_core::http_server::HttpServer::<
             flowgen_http::server::EndpointDispatcher,
         >::new(
@@ -2189,22 +2220,36 @@ mod tests {
 
     #[test]
     fn test_task_registry_creates_n_minus_1_channels() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2231,20 +2276,28 @@ mod tests {
 
     #[test]
     fn test_task_registry_single_task() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![TaskType::script(
-                    flowgen_core::task::script::config::Processor::default(),
-                )],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![TaskType::script(
+                            flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            },
+                        )],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2260,22 +2313,36 @@ mod tests {
 
     #[test]
     fn test_task_registry_partition_blocking_vs_background() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![
-                    TaskType::http_endpoint(flowgen_http::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            TaskType::http_endpoint(flowgen_http::config::Processor {
+                                name: "h".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
         let (blocking, background) = registry.partition();
@@ -2303,18 +2370,23 @@ mod tests {
 
     #[test]
     fn test_task_registry_empty_flow() {
-        use crate::config::{Flow, FlowConfig};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw};
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2323,22 +2395,36 @@ mod tests {
 
     #[test]
     fn test_task_registry_preserves_task_order() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "test_flow".to_string(),
-                labels: None,
-                tasks: vec![
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                    TaskType::script(flowgen_core::task::script::config::Processor::default()),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("test_flow".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                            TaskType::script(flowgen_core::task::script::config::Processor {
+                                name: "s".to_string(),
+                                ..Default::default()
+                            }),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2349,7 +2435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downstream_leaves_fan_out_fan_in() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script_with_deps = |name: &str, deps: Option<Vec<&str>>| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2359,25 +2445,30 @@ mod tests {
             })
         };
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "fan_out_fan_in".to_string(),
-                labels: None,
-                tasks: vec![
-                    script_with_deps("trigger", None),
-                    script_with_deps("read_a", Some(vec!["trigger"])),
-                    script_with_deps("convert_a", Some(vec!["read_a"])),
-                    script_with_deps("read_b", Some(vec!["trigger"])),
-                    script_with_deps("convert_b", Some(vec!["read_b"])),
-                    script_with_deps("buffer", Some(vec!["convert_a", "convert_b"])),
-                    script_with_deps("join", Some(vec!["buffer"])),
-                    script_with_deps("write", Some(vec!["join"])),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("fan_out_fan_in".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            script_with_deps("trigger", None),
+                            script_with_deps("read_a", Some(vec!["trigger"])),
+                            script_with_deps("convert_a", Some(vec!["read_a"])),
+                            script_with_deps("read_b", Some(vec!["trigger"])),
+                            script_with_deps("convert_b", Some(vec!["read_b"])),
+                            script_with_deps("buffer", Some(vec!["convert_a", "convert_b"])),
+                            script_with_deps("join", Some(vec!["buffer"])),
+                            script_with_deps("write", Some(vec!["join"])),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2406,7 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downstream_leaves_true_fan_out() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script_with_deps = |name: &str, deps: Option<Vec<&str>>| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2416,20 +2507,25 @@ mod tests {
             })
         };
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "fan_out".to_string(),
-                labels: None,
-                tasks: vec![
-                    script_with_deps("source", None),
-                    script_with_deps("leaf_a", Some(vec!["source"])),
-                    script_with_deps("leaf_b", Some(vec!["source"])),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("fan_out".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            script_with_deps("source", None),
+                            script_with_deps("leaf_a", Some(vec!["source"])),
+                            script_with_deps("leaf_b", Some(vec!["source"])),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2449,7 +2545,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downstream_leaves_nested_diamonds() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script_with_deps = |name: &str, deps: Option<Vec<&str>>| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2459,24 +2555,29 @@ mod tests {
             })
         };
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "nested_diamonds".to_string(),
-                labels: None,
-                tasks: vec![
-                    script_with_deps("src", None),
-                    script_with_deps("a1", Some(vec!["src"])),
-                    script_with_deps("a2", Some(vec!["src"])),
-                    script_with_deps("mid", Some(vec!["a1", "a2"])),
-                    script_with_deps("b1", Some(vec!["mid"])),
-                    script_with_deps("b2", Some(vec!["mid"])),
-                    script_with_deps("sink", Some(vec!["b1", "b2"])),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("nested_diamonds".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            script_with_deps("src", None),
+                            script_with_deps("a1", Some(vec!["src"])),
+                            script_with_deps("a2", Some(vec!["src"])),
+                            script_with_deps("mid", Some(vec!["a1", "a2"])),
+                            script_with_deps("b1", Some(vec!["mid"])),
+                            script_with_deps("b2", Some(vec!["mid"])),
+                            script_with_deps("sink", Some(vec!["b1", "b2"])),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2504,7 +2605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downstream_leaves_mixed_fan_out_and_re_merge() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script_with_deps = |name: &str, deps: Option<Vec<&str>>| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2514,24 +2615,29 @@ mod tests {
             })
         };
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "mixed".to_string(),
-                labels: None,
-                tasks: vec![
-                    script_with_deps("src", None),
-                    script_with_deps("a", Some(vec!["src"])),
-                    script_with_deps("b", Some(vec!["src"])),
-                    script_with_deps("c", Some(vec!["src"])),
-                    script_with_deps("merge", Some(vec!["a", "b"])),
-                    script_with_deps("leaf_x", Some(vec!["merge"])),
-                    script_with_deps("leaf_y", Some(vec!["c"])),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("mixed".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            script_with_deps("src", None),
+                            script_with_deps("a", Some(vec!["src"])),
+                            script_with_deps("b", Some(vec!["src"])),
+                            script_with_deps("c", Some(vec!["src"])),
+                            script_with_deps("merge", Some(vec!["a", "b"])),
+                            script_with_deps("leaf_x", Some(vec!["merge"])),
+                            script_with_deps("leaf_y", Some(vec!["c"])),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2559,7 +2665,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_downstream_leaves_linear_chain() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script_with_deps = |name: &str, deps: Option<Vec<&str>>| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2569,21 +2675,26 @@ mod tests {
             })
         };
 
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "linear".to_string(),
-                labels: None,
-                tasks: vec![
-                    script_with_deps("t0", None),
-                    script_with_deps("t1", Some(vec!["t0"])),
-                    script_with_deps("t2", Some(vec!["t1"])),
-                    script_with_deps("t3", Some(vec!["t2"])),
-                ],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("linear".to_string()),
+                        labels: None,
+                        tasks: vec![
+                            script_with_deps("t0", None),
+                            script_with_deps("t1", Some(vec!["t0"])),
+                            script_with_deps("t2", Some(vec!["t1"])),
+                            script_with_deps("t3", Some(vec!["t2"])),
+                        ],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2599,7 +2710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_only_tasks_get_no_implicit_parent() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let mcp_prompt = |name: &str| {
             TaskType::mcp_prompt(flowgen_mcp::prompt::config::Processor {
@@ -2616,16 +2727,21 @@ mod tests {
         // Two mcp_prompts back-to-back without any `depends_on:` — both
         // should register as independent sources, neither should inherit
         // the other as a parent.
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "registration_only".to_string(),
-                labels: None,
-                tasks: vec![mcp_prompt("a"), mcp_prompt("b")],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("registration_only".to_string()),
+                        labels: None,
+                        tasks: vec![mcp_prompt("a"), mcp_prompt("b")],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
@@ -2645,7 +2761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_implicit_parent_skips_registration_only() {
-        use crate::config::{Flow, FlowConfig, TaskType};
+        use crate::config::{Flow, FlowConfig, FlowConfigRaw, TaskType};
 
         let script = |name: &str| {
             TaskType::script(flowgen_core::task::script::config::Processor {
@@ -2669,16 +2785,21 @@ mod tests {
         // script → mcp_prompt → script: the trailing script should chain
         // back to the first script through the mcp_prompt, not treat the
         // prompt as its parent.
-        let flow_config = Arc::new(FlowConfig {
-            flow: Flow {
-                name: "skip_registration".to_string(),
-                labels: None,
-                tasks: vec![script("first"), mcp_prompt("register"), script("last")],
-                require_leader_election: None,
-                parallel_instances: 1,
-            },
-            raw_source: None,
-        });
+        let flow_config = Arc::new(
+            FlowConfig::from_name(
+                FlowConfigRaw {
+                    flow: Flow {
+                        name: Some("skip_registration".to_string()),
+                        labels: None,
+                        tasks: vec![script("first"), mcp_prompt("register"), script("last")],
+                        require_leader_election: None,
+                        parallel_instances: 1,
+                    },
+                },
+                None,
+            )
+            .expect("test fixture must have valid identity"),
+        );
 
         let registry = TaskRegistry::builder(flow_config, 100).build().unwrap();
 
