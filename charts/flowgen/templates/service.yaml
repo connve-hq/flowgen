@@ -1,5 +1,6 @@
 {{- $worker := index .Values "flowgen" -}}
 {{- if $worker.enabled }}
+{{- if $worker.http_server }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -15,6 +16,7 @@ spec:
     targetPort: http
     protocol: TCP
     name: http
+{{- end }}
 {{- if $worker.mcp_server }}
 ---
 apiVersion: v1
@@ -32,5 +34,41 @@ spec:
     targetPort: mcp
     protocol: TCP
     name: mcp
+{{- end }}
+{{- if $worker.ai_gateway }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flowgen.fullname" . }}-ai-gateway
+  labels:
+    {{- include "flowgen.labels" . | nindent 4 }}
+spec:
+  type: {{ $worker.ai_gateway.type }}
+  selector:
+    {{- include "flowgen.selectorLabels" . | nindent 4 }}
+  ports:
+  - port: {{ $worker.ai_gateway.port }}
+    targetPort: ai-gateway
+    protocol: TCP
+    name: ai-gateway
+{{- end }}
+{{- if $worker.web }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "flowgen.fullname" . }}-web
+  labels:
+    {{- include "flowgen.labels" . | nindent 4 }}
+spec:
+  type: {{ $worker.web.type }}
+  selector:
+    {{- include "flowgen.selectorLabels" . | nindent 4 }}
+  ports:
+  - port: {{ $worker.web.port }}
+    targetPort: web
+    protocol: TCP
+    name: web
 {{- end }}
 {{- end }}

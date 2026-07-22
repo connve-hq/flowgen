@@ -105,7 +105,14 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
-    /// Processes a single message result.
+    /// Processes a single message result. Wrapped in a `task.handle`
+    /// span so the admin UI's activity feed reports per-message
+    /// duration, matching how processors expose it.
+    #[tracing::instrument(
+        skip(self, message_result),
+        name = "task.handle",
+        fields(duration_ms = tracing::field::Empty)
+    )]
     async fn process_message(
         &self,
         message_result: Result<
@@ -255,9 +262,12 @@ impl flowgen_core::task::runner::Runner for Subscriber {
                 let credentials_path = init_config.credentials_path.clone();
                 let url = init_config.url.clone();
                 async move {
-                    let client = crate::client::ClientBuilder::new()
-                        .credentials_path(credentials_path)
-                        .url(url)
+                    let mut builder = crate::client::ClientBuilder::new();
+                    builder.url(url);
+                    if let Some(path) = credentials_path {
+                        builder.credentials_path(path);
+                    }
+                    let client = builder
                         .build()
                         .map_err(|source| Error::Client { source })?
                         .connect()
@@ -556,7 +566,7 @@ mod tests {
     async fn test_subscriber_builder() {
         let config = Arc::new(super::super::config::Subscriber {
             name: "test_subscriber".to_string(),
-            credentials_path: PathBuf::from("/test/creds.jwt"),
+            credentials_path: Some(PathBuf::from("/test/creds.jwt")),
             subject: "test.subject".to_string(),
             stream: Some(super::super::config::StreamOptions {
                 name: "test_stream".to_string(),
@@ -602,7 +612,7 @@ mod tests {
     async fn test_subscriber_builder_build_missing_task_context() {
         let config = Arc::new(super::super::config::Subscriber {
             name: "test_subscriber".to_string(),
-            credentials_path: PathBuf::from("/test/creds.jwt"),
+            credentials_path: Some(PathBuf::from("/test/creds.jwt")),
             subject: "test.subject".to_string(),
             stream: Some(super::super::config::StreamOptions {
                 name: "test_stream".to_string(),

@@ -1,0 +1,210 @@
+# Bootstrap flow: reconciles a full flowgen workspace (flows + resources)
+# from a single Git repository into the system NATS KV cache. Each tick
+# pulls the repo, routes each file by its top-level directory —
+# `flows/` files are keyed by `flow.name` under `flowgen.flows.`,
+# `resources/` files are keyed by their path (with the `resources/`
+# prefix stripped) under `flowgen.resources.`. Any other files in the
+# scan path are ignored. Cache entries no longer present in the repo
+# are deleted.
+#
+# Flows and resources ship together in one release cadence — one repo,
+# one commit, one PR per change.
+#
+# Repo layout expected under the configured `path:`
+#
+#   workspace/
+#   ├── flows/
+#   │   └── ...*.yaml
+#   └── resources/
+#       └── ...
+#
+# Required:
+#   - GIT_WORKSPACE_URL env var, e.g.
+#       https://github.com/org/flowgen-workspace.git
+#   - /etc/flowgen/credentials/git.json with
+#       { "token": "..." }
+#   - /etc/nats/credentials.json for NATS KV writes.
+#   - NATS_URL env var (e.g. nats://localhost:4222)
+flow:
+  labels:
+    display_name: "Sync Workspace From Git"
+    description: "Reconciles a full flowgen workspace of flows and resources from a Git repository into the system NATS KV cache each tick, computing put/delete diffs and skipping when the repo commit is unchanged."
+    tags: ["system", "git-sync", "nats-kv", "reconcile", "example"]
+  require_leader_election: true
+  tasks:
+
+    - generate:
+        name: tick
+        interval: "30s"
+
+    - git_sync:
+        name: pull_repo
+        repository_url: "{{env.GIT_WORKSPACE_URL}}"
+        branch: main
+        path: "workspace/"
+        credentials_path: /etc/flowgen/credentials/git.json
+
+    - buffer:
+        name: collect_files
+        size: 10000
+        timeout: "5s"
+        flush_on_completion: true
+
+    - script:
+        name: stash_files
+        code: |
+          ctx.meta.file_batch = event.data.batch;
+          event
+
+    - nats_kv_store:
+        name: list_existing_flows
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        bucket: flowgen_system
+        operation: list
+        key_prefix: "flowgen.flows."
+        # Include current values so compute_diff can skip put actions
+        # when the YAML in cache already matches — every put bumps the
+        # KV revision and fires a watcher hot-reload on every pod,
+        # which races leader-election leases.
+        include_values: true
+
+    - script:
+        name: stash_existing_flows
+        code: |
+          ctx.meta.existing_flows_keys = event.data.keys;
+          ctx.meta.existing_flows_values = event.data.values;
+          event
+
+    - nats_kv_store:
+        name: list_existing_resources
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        bucket: flowgen_system
+        operation: list
+        key_prefix: "flowgen.resources."
+        include_values: true
+
+    # Short-circuit only when nothing has drifted: the repo commit
+    # matches the last successful sync AND the total cache key count
+    # matches the routable file count.
+    - script:
+        name: skip_if_in_sync
+        code: |
+          let current_commit = event.meta.file_batch[0].commit;
+          let last_synced = ctx.cache.get("last_synced_commit");
+          let routable = 0;
+          for file in event.meta.file_batch {
+              if file.path.starts_with("flows/") || file.path.starts_with("resources/") {
+                  routable += 1;
+              }
+          }
+          let key_count = event.meta.existing_flows_keys.len() + event.data.keys.len();
+          if last_synced == current_commit && routable == key_count {
+              ()
+          } else {
+              ctx.meta.current_commit = current_commit;
+              event
+          }
+
+    # Route each file by its top-level directory:
+    #   flows/foo.yaml     → flowgen.flows.<parsed flow.name>
+    #   resources/bar.sql  → flowgen.resources.bar.sql
+    #   anything else      → dropped (README.md, etc.)
+    - script:
+        name: compute_diff
+        code: |
+          let files = event.meta.file_batch;
+          let existing_flows = event.meta.existing_flows_keys;
+          let current_flows = event.meta.existing_flows_values;
+          let existing_resources = event.data.keys;
+          let current_resources = event.data.values;
+          let present = #{};
+          let actions = [];
+          for file in files {
+              let key = if file.path.starts_with("flows/") {
+                  let parsed = parse_yaml(file.content);
+                  "flowgen.flows." + parsed.flow.name
+              } else if file.path.starts_with("resources/") {
+                  "flowgen.resources." + file.path.sub_string(10)
+              } else {
+                  continue;
+              };
+              present[key] = true;
+              let cached = if key.starts_with("flowgen.flows.") {
+                  current_flows[key]
+              } else {
+                  current_resources[key]
+              };
+              if cached != file.content {
+                  actions.push(#{
+                      action: "put",
+                      key: key,
+                      content: file.content,
+                  });
+              }
+          }
+          for key in existing_flows {
+              if present[key] != true {
+                  actions.push(#{
+                      action: "delete",
+                      key: key,
+                      content: "",
+                  });
+              }
+          }
+          for key in existing_resources {
+              if present[key] != true {
+                  actions.push(#{
+                      action: "delete",
+                      key: key,
+                      content: "",
+                  });
+              }
+          }
+          actions
+
+    - script:
+        name: select_puts
+        code: |
+          if event.data.action == "put" {
+              event
+          } else {
+              ()
+          }
+        depends_on: [compute_diff]
+
+    - script:
+        name: select_deletes
+        code: |
+          if event.data.action == "delete" {
+              event
+          } else {
+              ()
+          }
+        depends_on: [compute_diff]
+
+    - nats_kv_store:
+        name: write_to_cache
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        bucket: flowgen_system
+        operation: put
+        key: "{{event.data.key}}"
+        depends_on: [select_puts]
+
+    - nats_kv_store:
+        name: delete_from_cache
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        bucket: flowgen_system
+        operation: delete
+        key: "{{event.data.key}}"
+        depends_on: [select_deletes]
+
+    - script:
+        name: mark_synced
+        code: |
+          ctx.cache.put("last_synced_commit", event.meta.current_commit);
+          event
+        depends_on: [write_to_cache, delete_from_cache]

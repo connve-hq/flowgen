@@ -21,6 +21,8 @@ pub mod credentials;
 pub mod event;
 /// Executor for distributed coordination via cache-based leases.
 pub mod executor;
+/// Dedicated liveness/readiness listener for Kubernetes probes.
+pub mod health;
 /// Generic HTTP server with role-specific dispatchers (webhook / MCP / AI gateway).
 pub mod http_server;
 /// Peer discovery and flow distribution via consistent hashing.
@@ -44,6 +46,14 @@ pub mod serde;
 pub mod service;
 /// OpenTelemetry integration for metrics and distributed tracing.
 pub mod telemetry;
+/// Flow-scoped runtime bookkeeping: activity metrics fed by a custom
+/// tracing layer, plus the SSE broadcast channel the admin UI reads.
+pub mod flow {
+    /// Atomic counters + broadcast channel used by the admin API.
+    pub mod activity;
+    /// Tracing layer that populates activity from runtime log events.
+    pub mod activity_layer;
+}
 /// Validation helpers for config-supplied identifiers and paths.
 pub mod validate;
 /// Task execution framework with runner trait, context, and manager.

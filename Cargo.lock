@@ -1967,15 +1967,18 @@ dependencies = [
 
 [[package]]
 name = "flowgen"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "arrow",
  "atty",
+ "axum 0.8.9",
  "bytes",
+ "chrono",
  "clap",
  "config",
  "flowgen_ai_agent",
  "flowgen_braze",
+ "flowgen_client",
  "flowgen_core",
  "flowgen_gcp",
  "flowgen_git",
@@ -1992,14 +1995,19 @@ dependencies = [
  "futures-util",
  "glob",
  "humantime-serde",
+ "mime_guess",
  "native-tls",
+ "reqwest 0.13.4",
+ "rust-embed",
  "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "testcontainers",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
@@ -2007,8 +2015,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowgen-chart-tests"
+version = "0.128.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
 name = "flowgen_ai_agent"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2038,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_braze"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "braze",
@@ -2054,8 +2070,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowgen_client"
+version = "0.128.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "openapiv3",
+ "progenitor",
+ "progenitor-client",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "flowgen_core"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2082,6 +2115,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rhai",
+ "secrecy",
  "serde",
  "serde_avro_fast",
  "serde_json",
@@ -2102,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_gcp"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "arrow",
  "arrow-json",
@@ -2130,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_git"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "flowgen_core",
@@ -2148,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_html"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "flowgen_core",
@@ -2164,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_http"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "arrow-json",
  "async-trait",
@@ -2190,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_mcp"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -2218,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_mongo"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2247,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_mssql"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2270,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_nats"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "arrow",
  "async-nats",
@@ -2286,6 +2320,8 @@ dependencies = [
  "prost 0.13.5",
  "serde",
  "serde_json",
+ "tempfile",
+ "testcontainers",
  "thiserror 1.0.69",
  "tokio",
  "tokio-retry2",
@@ -2297,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_object_store"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -2320,10 +2356,11 @@ dependencies = [
 
 [[package]]
 name = "flowgen_oci"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "flate2",
  "flowgen_core",
  "futures-util",
@@ -2342,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_salesforce"
-version = "0.122.0"
+version = "0.128.0"
 dependencies = [
  "apache-avro",
  "arrow",
@@ -6784,6 +6821,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-embed"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04113cb9355a377d83f06ef1f0a45b8ab8cd7d8b1288160717d66df5c7988d27"
+dependencies = [
+ "rust-embed-impl",
+ "rust-embed-utils",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-impl"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da0902e4c7c8e997159ab384e6d0fc91c221375f6894346ae107f47dd0f3ccaa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "rust-embed-utils",
+ "syn",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-utils"
+version = "8.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5bcdef0be6fe7f6fa333b1073c949729274b05f123a0ad7efcb8efd878e5c3b1"
+dependencies = [
+ "sha2 0.10.9",
+ "walkdir",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7155,6 +7226,16 @@ dependencies = [
  "precomputed-hash",
  "selectors",
  "tendril",
+]
+
+[[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -8138,6 +8219,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

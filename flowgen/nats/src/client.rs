@@ -55,9 +55,8 @@ pub enum Error {
 /// NATS client with optional JetStream context for reliable messaging.
 #[derive(Debug)]
 pub struct Client {
-    /// Path to the NATS credentials file.
-    /// This file contains authentication credentials in JSON format.
-    credentials_path: PathBuf,
+    /// Optional path to the NATS credentials file.
+    credentials_path: Option<PathBuf>,
     /// NATS server URL (e.g., "nats://localhost:4222" or "localhost:4222").
     /// If not set, defaults to "localhost:4222".
     url: Option<String>,
@@ -70,29 +69,27 @@ impl flowgen_core::client::Client for Client {
 
     /// Connects to the NATS server with the provided options.
     async fn connect(mut self) -> Result<Self, Error> {
-        // Read and parse credentials file.
-        let credentials: Credentials =
-            serde_json::from_str(&fs::read_to_string(&self.credentials_path).map_err(|e| {
-                Error::ReadCredentials {
-                    path: self.credentials_path.clone(),
-                    source: e,
+        let connect_options = match &self.credentials_path {
+            Some(path) => {
+                let credentials: Credentials =
+                    serde_json::from_str(&fs::read_to_string(path).map_err(|e| {
+                        Error::ReadCredentials {
+                            path: path.clone(),
+                            source: e,
+                        }
+                    })?)
+                    .map_err(|e| Error::ParseCredentials { source: e })?;
+                match credentials.nkey {
+                    // NKey seed is passed to async_nats; server validates
+                    // against the configured public key.
+                    Some(nkey_creds) => async_nats::ConnectOptions::with_nkey(nkey_creds.seed),
+                    None => return Err(Error::NoCredentials),
                 }
-            })?)
-            .map_err(|e| Error::ParseCredentials { source: e })?;
-
-        // Build connect options based on credential type.
-        let connect_options = if let Some(nkey_creds) = credentials.nkey {
-            // For NKey authentication, the seed (private key) is passed to async_nats.
-            // The seed is used to sign authentication challenges, and the server validates against the public key.
-            async_nats::ConnectOptions::with_nkey(nkey_creds.seed)
-        } else {
-            return Err(Error::NoCredentials);
+            }
+            None => async_nats::ConnectOptions::default(),
         };
 
-        // Use provided URL or fall back to default.
         let url = self.url.as_deref().unwrap_or(DEFAULT_NATS_URL);
-
-        // Connect to NATS server.
         let nats_client = connect_options
             .connect(url)
             .await
@@ -101,9 +98,7 @@ impl flowgen_core::client::Client for Client {
                 source: e,
             })?;
 
-        // Initialize JetStream context.
         let jetstream = async_nats::jetstream::new(nats_client);
-
         self.jetstream = Some(jetstream);
         Ok(self)
     }
@@ -132,7 +127,7 @@ impl ClientBuilder {
     /// ```json
     /// {
     ///   "nkey": {
-    ///     "seed": "SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY"
+    ///     "seed": "your-private-key"
     ///   }
     /// }
     /// ```
@@ -149,14 +144,9 @@ impl ClientBuilder {
     }
 
     /// Builds a new NATS client instance.
-    ///
-    /// Returns an error if `credentials_path` is not provided.
     pub fn build(&self) -> Result<Client, Error> {
         Ok(Client {
-            credentials_path: self
-                .credentials_path
-                .clone()
-                .ok_or_else(|| Error::MissingBuilderAttribute("credentials_path".to_string()))?,
+            credentials_path: self.credentials_path.clone(),
             url: self.url.clone(),
             jetstream: None,
         })
@@ -182,7 +172,7 @@ mod tests {
     fn test_credentials_nkey_deserialization() {
         let json_creds = r#"{
             "nkey": {
-                "seed": "SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY"
+                "seed": "your-private-key"
             }
         }"#;
 
@@ -193,10 +183,7 @@ mod tests {
         assert!(creds.nkey.is_some());
 
         let nkey = creds.nkey.unwrap();
-        assert_eq!(
-            nkey.seed,
-            "SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY"
-        );
+        assert_eq!(nkey.seed, "your-private-key");
     }
 
     #[test]
@@ -213,7 +200,7 @@ mod tests {
     #[test]
     fn test_nkey_credentials_clone() {
         let nkey = NKeyCredentials {
-            seed: "SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY".to_string(),
+            seed: "your-private-key".to_string(),
         };
 
         let cloned = nkey.clone();

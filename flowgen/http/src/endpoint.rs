@@ -21,7 +21,7 @@ use std::{fs, sync::Arc};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info};
+use tracing::{error, info, Instrument};
 
 /// JSON key for HTTP headers in endpoint events.
 const DEFAULT_HEADERS_KEY: &str = "headers";
@@ -202,7 +202,7 @@ impl flowgen_core::task::runner::Runner for Processor {
         };
 
         let registration = crate::server::EndpointRegistration {
-            flow_name: self.task_context.flow.name.clone(),
+            flow_name: self.task_context.flow.identity().to_string(),
             config: Arc::clone(&self.config),
             credentials: event_handler.credentials.clone(),
             auth_provider: event_handler.auth_provider.clone(),
@@ -325,15 +325,32 @@ pub async fn dispatch(
     headers: HeaderMap,
     body: Body,
 ) -> axum::response::Response<Body> {
+    let run_span = tracing::info_span!(
+        "task.run",
+        flow = %registration.flow_name,
+        task = %registration.config.name,
+        task_id = registration.task_id,
+        task_type = %registration.task_type,
+    );
+    let handle_span = tracing::info_span!(
+        parent: &run_span,
+        "task.handle",
+        duration_ms = tracing::field::Empty,
+    );
+
     if registration.config.stream {
         dispatch_stream(registration, headers, body)
+            .instrument(handle_span)
             .await
             .unwrap_or_else(|e| {
                 error!(error = %e, "Endpoint stream dispatch failed");
                 e.into_response()
             })
     } else {
-        match dispatch_blocking(registration, headers, body).await {
+        match dispatch_blocking(registration, headers, body)
+            .instrument(handle_span)
+            .await
+        {
             Ok(status) => status.into_response(),
             Err(e) => {
                 error!(error = %e, "Endpoint dispatch failed");
@@ -767,6 +784,7 @@ mod tests {
             connect_timeout: crate::config::default_connect_timeout(),
             max_body_bytes: crate::config::default_max_body_bytes(),
             stream: false,
+            response_type: crate::config::ResponseType::default(),
             auth: None,
             depends_on: None,
             retry: None,

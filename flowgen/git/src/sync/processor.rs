@@ -5,6 +5,7 @@
 //! with the files (parse as flows, write to cache, store in object store).
 
 use super::config::{Credentials, Processor as ProcessorConfig};
+use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventBuilder, EventData, EventExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,6 +102,11 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    #[error("Failed to render git sync config: {source}")]
+    RenderConfig {
+        #[source]
+        source: flowgen_core::config::Error,
+    },
     #[error("Error building event: {source}")]
     EventBuilder {
         #[source]
@@ -134,6 +140,11 @@ pub struct EventHandler {
 
 impl EventHandler {
     /// Handles a trigger event by syncing the repository and emitting file events.
+    #[tracing::instrument(
+        skip(self, event),
+        name = "task.handle",
+        fields(duration_ms = tracing::field::Empty)
+    )]
     async fn handle(&self, event: Event) -> Result<(), Error> {
         if self.task_context.cancellation_token.is_cancelled() {
             return Ok(());
@@ -154,7 +165,7 @@ impl EventHandler {
             // Skip the file walk when HEAD matches the last successful
             // sync — file contents at the same commit are byte-identical.
             let cache = &self.task_context.cache;
-            let flow_name = &self.task_context.flow.name;
+            let flow_name = self.task_context.flow.identity();
             let sanitized_url = sanitize_repo_url(&self.config.repository_url);
             let cache_key = format!("flow.{flow_name}.git_head.{sanitized_url}");
             let cached_commit = cache
@@ -489,15 +500,24 @@ impl flowgen_core::task::runner::Runner for Processor {
     type EventHandler = EventHandler;
 
     async fn init(&self) -> Result<EventHandler, Error> {
-        if self.config.repository_url.starts_with("git@")
-            || self.config.repository_url.starts_with("ssh://")
+        // Render the config at init time so operator-controlled fields such
+        // as `repository_url`, `branch`, `path`, and `clone_path` can
+        // reference environment variables via `{{env.VAR_NAME}}`. Event data
+        // is intentionally not in scope here — these values are static for
+        // the lifetime of the task.
+        let config: ProcessorConfig = self
+            .config
+            .render(&serde_json::json!({}))
+            .map_err(|source| Error::RenderConfig { source })?;
+
+        if config.repository_url.starts_with("git@") || config.repository_url.starts_with("ssh://")
         {
             return Err(Error::SshUrl {
-                url: self.config.repository_url.clone(),
+                url: config.repository_url.clone(),
             });
         }
 
-        let credentials = match &self.config.credentials_path {
+        let credentials = match &config.credentials_path {
             Some(path) => {
                 let content = tokio::fs::read_to_string(path).await.map_err(|source| {
                     Error::ReadCredentials {
@@ -515,22 +535,22 @@ impl flowgen_core::task::runner::Runner for Processor {
             None => None,
         };
 
-        let clone_path = match &self.config.clone_path {
+        let clone_path = match &config.clone_path {
             Some(path) => {
                 flowgen_core::validate::validate_path(
                     flowgen_core::validate::PathField("clone_path"),
                     path,
                 )
                 .map_err(|source| Error::InvalidClonePath { source })?;
-                path.clone()
+                path.to_path_buf()
             }
             None => std::env::temp_dir()
-                .join(&self.task_context.flow.name)
-                .join(&self.config.name),
+                .join(self.task_context.flow.identity())
+                .join(&config.name),
         };
 
         Ok(EventHandler {
-            config: Arc::clone(&self.config),
+            config: Arc::new(config),
             clone_path,
             credentials,
             tx: self.tx.clone(),

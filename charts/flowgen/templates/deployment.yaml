@@ -27,16 +27,20 @@ spec:
       labels:
         {{- include "flowgen.selectorLabels" . | nindent 8 }}
     spec:
+      {{- $podSpec := dict "serviceAccountName" (include "flowgen.serviceAccountName" .) "securityContext" $worker.podSecurityContext }}
       {{- with .Values.global.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+      {{- $_ := set $podSpec "imagePullSecrets" . }}
       {{- end }}
-      serviceAccountName: {{ include "flowgen.serviceAccountName" . }}
       {{- with $worker.terminationGracePeriodSeconds }}
-      terminationGracePeriodSeconds: {{ . }}
+      {{- $_ := set $podSpec "terminationGracePeriodSeconds" . }}
       {{- end }}
-      securityContext:
-        {{- toYaml $worker.podSecurityContext | nindent 8 }}
+      {{- if $worker.podTemplate.merge }}
+      {{- $podSpec = mergeOverwrite $podSpec $worker.podTemplate.merge }}
+      {{- end }}
+      {{- if $worker.podTemplate.patch }}
+      {{- $podSpec = get (include "jsonpatch" (dict "doc" $podSpec "patch" $worker.podTemplate.patch) | fromJson) "doc" }}
+      {{- end }}
+      {{- toYaml $podSpec | nindent 6 }}
       containers:
       - name: {{ .Chart.Name }}
         command: ["/bin/flowgen", "--config", "{{ $worker.config.path }}"]
@@ -57,25 +61,40 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
         ports:
+        {{- if $worker.http_server }}
         - name: http
           containerPort: {{ $worker.http_server.port }}
           protocol: TCP
+        {{- end }}
         {{- if $worker.mcp_server }}
         - name: mcp
           containerPort: {{ $worker.mcp_server.port }}
           protocol: TCP
         {{- end }}
+        {{- if $worker.ai_gateway }}
+        - name: ai-gateway
+          containerPort: {{ $worker.ai_gateway.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if $worker.web }}
+        - name: web
+          containerPort: {{ $worker.web.port }}
+          protocol: TCP
+        {{- end }}
+        - name: health
+          containerPort: {{ default 8081 (dig "health" "port" nil $worker) }}
+          protocol: TCP
         readinessProbe:
           httpGet:
-            path: /healthz
-            port: http
+            path: /readyz
+            port: health
           initialDelaySeconds: 5
           periodSeconds: 10
           failureThreshold: 3
         livenessProbe:
           httpGet:
-            path: /healthz
-            port: http
+            path: /livez
+            port: health
           initialDelaySeconds: 10
           periodSeconds: 15
           failureThreshold: 3

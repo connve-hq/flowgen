@@ -35,6 +35,8 @@ pub enum Error {
     ExpectedJsonGotArrowRecordBatch,
     #[error("Expected JSON event data, got Avro")]
     ExpectedJsonGotAvro,
+    #[error("Expected JSON event data, got binary Bytes")]
+    ExpectedJsonGotBytes,
     #[error("Missing required builder attribute: {}", _0)]
     MissingBuilderAttribute(String),
     #[error("Error rendering buffer key template: {source}")]
@@ -245,7 +247,11 @@ impl Processor {
                     error!(error = %e, "Failed to send flush event");
                 }
             }
-            .instrument(tracing::Span::current()),
+            .instrument(tracing::info_span!(
+                parent: tracing::Span::current(),
+                "task.handle",
+                duration_ms = tracing::field::Empty,
+            )),
         );
     }
 
@@ -309,6 +315,9 @@ impl Processor {
                                 }
                                 EventData::Avro(_) => {
                                     return Err(Error::ExpectedJsonGotAvro);
+                                }
+                                EventData::Bytes(_) => {
+                                    return Err(Error::ExpectedJsonGotBytes);
                                 }
                             };
 
@@ -415,6 +424,9 @@ impl Processor {
                                 }
                                 EventData::Avro(_) => {
                                     return Err(Error::ExpectedJsonGotAvro);
+                                }
+                                EventData::Bytes(_) => {
+                                    return Err(Error::ExpectedJsonGotBytes);
                                 }
                             };
 

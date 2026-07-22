@@ -397,7 +397,7 @@ impl EventHandler {
     }
 
     /// Non-streaming completion: waits for the full response and emits a single event.
-    #[tracing::instrument(skip(self, event), name = "task.handle")]
+    #[tracing::instrument(skip(self, event), name = "task.handle", fields(duration_ms = tracing::field::Empty))]
     async fn handle_non_streaming(&self, event: Event) -> Result<(), Error> {
         let started_at = std::time::Instant::now();
         let client = self.resolve_client(&event).await?;
@@ -689,7 +689,7 @@ impl EventHandler {
     /// then a final chunk with `is_final: true`. Only the final event carries
     /// the completion signal so downstream tasks see all chunks before the
     /// source considers the request complete.
-    #[tracing::instrument(skip(self, event), name = "task.handle")]
+    #[tracing::instrument(skip(self, event), name = "task.handle", fields(duration_ms = tracing::field::Empty))]
     async fn handle_streaming(&self, event: Event) -> Result<(), Error> {
         let started_at = std::time::Instant::now();
         let event = Arc::new(event);
@@ -936,17 +936,20 @@ impl EventHandler {
             latency_ms: started_at.elapsed().as_millis() as u64,
         };
 
-        let mut meta = serde_json::Map::new();
-        completion_ctx.insert_into(&mut meta);
-
+        // Start from the upstream event's meta so custom fields stashed by
+        // preceding tasks (via ctx.meta in scripts, for example) survive
+        // through the completion — then layer the completion context on top.
+        // Replacing meta wholesale here silently drops per-event state that
+        // downstream tasks depend on.
         let mut event = EventBuilder::new()
             .data(EventData::Json(response_value))
             .subject(self.config.name.clone())
             .task_id(self.task_id)
             .task_type(self.task_type)
-            .meta(meta)
             .build()
             .map_err(|source| Error::EventBuilder { source })?;
+        let meta = event.meta.get_or_insert_with(serde_json::Map::new);
+        completion_ctx.insert_into(meta);
 
         // Signal completion or pass through to next task.
         match self.tx {

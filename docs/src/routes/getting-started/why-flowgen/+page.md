@@ -34,7 +34,6 @@ We started Flowgen while running data pipelines at a consumer business with hund
 
 ```yaml
 flow:
-  name: webhook_to_nats
   tasks:
     - http_endpoint:
         name: ingest
@@ -55,7 +54,7 @@ flow:
     - nats_jetstream_publisher:
         name: publish
         credentials_path: /etc/nats/credentials.json
-        url: nats://localhost:4222
+        url: "{{env.NATS_URL}}"
         subject: events.normalized
         stream:
           name: events

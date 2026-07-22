@@ -55,6 +55,8 @@ pub enum Error {
         "ArrowRecordBatch to Avro conversion is not supported. Please convert data to JSON first."
     )]
     ArrowToAvroNotSupported,
+    #[error("Convert task does not accept binary (EventData::Bytes) input; decode the payload upstream before converting")]
+    UnsupportedEventData,
     #[error("Arrow schema casting error: {source}")]
     ArrowCast {
         #[source]
@@ -137,7 +139,7 @@ enum SchemaConfig {
 
 impl EventHandler {
     /// Processes an event and converts to selected target format.
-    #[tracing::instrument(skip(self, event), name = "task.handle")]
+    #[tracing::instrument(skip(self, event), name = "task.handle", fields(duration_ms = tracing::field::Empty))]
     async fn handle(&self, event: Event) -> Result<(), Error> {
         if self.task_context.cancellation_token.is_cancelled() {
             return Ok(());
@@ -260,6 +262,7 @@ impl EventHandler {
                         EventData::Avro(avro_data.clone())
                     }
                 },
+                EventData::Bytes(_) => return Err(Error::UnsupportedEventData),
             };
 
             let mut e = event_builder

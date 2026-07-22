@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 flowgen_core = { path = "../core" }
+flowgen_client = { workspace = true }
 flowgen_http = { path = "../http" }
 flowgen_html = { path = "../html" }
 flowgen_salesforce = { path = "../salesforce" }
@@ -45,9 +46,17 @@ atty = { workspace = true }
 clap = { workspace = true }
 serde_yaml = { workspace = true }
 walkdir = { workspace = true }
+axum = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+rust-embed = { workspace = true }
+mime_guess = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+testcontainers = { workspace = true }
+bytes = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

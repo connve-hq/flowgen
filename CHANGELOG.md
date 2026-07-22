@@ -1,5 +1,415 @@
 # Changelog
 
+## 0.128.0
+
+### Breaking
+
+- **Flow identity is the file path, not `flow.name`.** A flow's identity
+  is now the file path relative to `flows.path` with the extension
+  stripped (e.g. `flows/demo/salesforce/reader.yaml` → identity
+  `demo/salesforce/reader`). This value drives the registry key, cache
+  namespaces, MCP URIs, activity keys, and the tracing `flow=` field.
+  Two flows with the same basename in different folders no longer
+  collide. The YAML `flow.name` field is now optional and only
+  meaningful when a flow is constructed programmatically (e.g. via the
+  admin API) without a filesystem path. `FlowConfig` validation rejects
+  configs without either a `source_path` or a `name`. Rhai `ctx.cache`
+  keys owned by flows loaded from a nested path change from
+  `<basename>.<key>` to `<full/path>.<key>` — cached state under old
+  keys becomes orphaned on upgrade.
+
+- **`log` task: `structured` field removed; body is always pretty JSON.**
+  The `structured` boolean is gone. The log line body is now always the
+  pretty-printed JSON of `event.data`, and the event `id` / `subject`
+  are emitted as structured tracing fields (`event.id`,
+  `event.subject`). A leftover `structured: true` in YAML is silently
+  ignored. Use `include_meta: true` to fold `event.meta` into the body.
+
+- **`FlowStatus` API enum renamed.** The admin API `status` value on
+  `/api/flows` changes `running` → `ok` and `warning` → `warn`
+  (`idle` and `error` unchanged). External consumers of the flow list
+  that match on these strings must update.
+
+- **JWT HMAC secret is redacted when config is serialized.** The
+  `auth.secret` field (MCP server / AI gateway JWT config) is now a
+  `secrecy::SecretString`: it never appears in `Debug` output or logs,
+  and serializes as `"***"`. The system config viewer therefore shows
+  `secret: "***"` instead of the plaintext key. Token validation is
+  unchanged. Anything that serialized this config and read the value
+  back out would now get `"***"` — the runtime never round-trips config
+  from its serialized form, so this only affects the read-only viewer.
+
+### Features
+
+- **System console at `/system`.** A new read-only admin view (reached
+  from the sidebar footer) renders the running `AppConfig` as YAML so
+  operators can inspect cache, telemetry, server, and flow settings
+  without shelling into the pod. Secrets are redacted (see above).
+  Backed by `GET /api/config`.
+
+- **Global log viewer at `/logs`.** A new admin UI tab streams every
+  retained log record (framework, lifecycle, and per-task activity) with
+  level filters, free-text search, live tail with pause/resume, a
+  detail drawer, and an adjustable line limit (default 1000, up to
+  10000). Backed by `GET /api/logs` (snapshot, `?limit=` capped at
+  10000) and `GET /api/logs/stream` (SSE). The per-flow activity feed
+  (`/api/flows/stream`) is a client-filtered subset of the same source;
+  both now ship the raw `LogRecord` shape and classify client-side.
+
+- **Three-way theme toggle.** The admin UI theme control is now
+  System / Light / Dark. `System` tracks the OS `prefers-color-scheme`
+  and reacts to it changing at runtime; the choice persists under the
+  `flowgen-theme` localStorage key (values `system` | `light` | `dark`,
+  replacing the previous boolean).
+
+- **Version badge links to release notes.** The version badge in the
+  sidebar footer links to the matching GitHub release
+  (`github.com/connve/flowgen/releases/tag/v<version>`).
+
+- **Activity events surface task-scope failures.** The admin UI's per-
+  flow activity panel now shows warnings and errors emitted from any
+  span inside `task.run` or `task.handle`, not just successful event
+  handling. Subscriber init failures ("Subscriber initialization
+  failed", DNS errors, permission denied) that used to only bump the
+  error counter without appearing in the feed are now visible with
+  their full context. Framework logs outside task scope (leader
+  election, HTTP server startup, cache reconnects) remain excluded.
+
+### Fixes
+
+- **Admin UI folder sidebar.** Flows and resources pages get a
+  collapsible folder tree derived from the identity path. Breadcrumb
+  shows the selected scope; row display is `display_name` (bold) +
+  path (mono, dimmed). Persists collapsed state per view.
+
+### Internal
+
+- **`activity = true` marker removed from every processor.** Activity
+  classification is now purely topological (span chain contains
+  `task.run` or `task.handle`) instead of a per-emit boolean that every
+  processor had to remember to declare. `StoredLog` gains structural
+  fields (`level`, `timestamp`, `target`, `spans: Vec<StoredSpan>`,
+  `fields`) so consumers no longer parse a flat `attributes` bag.
+
+## 0.127.0
+
+### Features
+
+- **Generated `flowgen_client` crate + `openapi.yaml` spec.** The
+  admin API (`/api/flows`, `/api/flows/{name}`, `/api/flows/stream`,
+  `/api/resources`, `/api/resources/{key}`, `/api/version`) and the
+  health endpoints (`/livez`, `/readyz`, `/healthz`) are now
+  described by `flowgen/api/client/openapi.yaml`, from which
+  `flowgen_client` is generated via `progenitor` at build time.
+  Consumers (web UI, CLI, external tooling) can depend on the crate
+  or fetch the spec directly.
+
+### Fixes
+
+- **Admin web UI works at any `web.path`.** The SvelteKit bundle
+  hardcodes `/flowgen` as its base at build time. `serve_embedded`
+  now rewrites `/flowgen/…` and bare `"/flowgen"` in every text
+  asset to whatever `web.path` the operator set, so mounting the UI
+  on `/`, `/admin`, or any custom prefix works without a rebuild.
+
+## 0.126.0
+
+### Fixes
+
+- **`oci_sync` HEAD-check now skips unchanged multi-arch tags.** The
+  cache stored the per-platform manifest digest, while HEAD returned
+  the index digest for multi-arch tags — so the compare never matched
+  and every tick re-pulled every layer. The cache now stores whatever
+  HEAD returned. Integration test
+  `oci_sync_second_tick_skips_when_manifest_unchanged` covers the
+  single-arch skip path.
+
+## 0.125.0
+
+### Breaking
+
+- **Kubernetes probes moved to a dedicated port.** The helm chart
+  (v0.19.0) points `livenessProbe` at `/livez` and `readinessProbe`
+  at `/readyz` on a new `health` port (default 8081), instead of
+  `/healthz` on the API port. Pins that override `livenessProbe` or
+  `readinessProbe` in `values.yaml` need to be updated. Anything
+  hardcoding `/healthz` on port 3000 in external tooling (ingress
+  health checks, external monitors) needs to switch to `/livez` on
+  port 8081. `/healthz` is preserved as an alias of `/livez` on the
+  new listener for pre-1.16 k8s convention.
+
+- **`telemetry.otlp_endpoint` replaced by `telemetry.backend`.** The
+  telemetry section now selects between an in-process backend and a
+  remote OTLP collector through a tagged `backend` block. Existing
+  configs that set `enabled: true` with no other fields still work
+  (they fall back to the in-memory backend). To keep pushing to a
+  collector, replace:
+
+  ```yaml
+  telemetry:
+    enabled: true
+    otlp_endpoint: "http://otel-collector:4317"
+  ```
+
+  with:
+
+  ```yaml
+  telemetry:
+    enabled: true
+    backend:
+      type: remote
+      endpoint: "http://otel-collector:4317"
+  ```
+
+### Features
+
+- **Dedicated k8s health listener at `flowgen_core::health`.** Spawns
+  its own axum listener on `health.port` (default 8081), independent
+  of the API listeners. Exposes `GET /livez` (always 200), `GET
+  /readyz` (200 once at least one flow is registered, 503 before),
+  and `GET /healthz` as an alias for `/livez`. Probes keep working
+  regardless of which API surfaces (`http_server`, `mcp_server`,
+  `ai_gateway`, `web`) are enabled. Set `health.enabled: false` to
+  disable the listener entirely.
+
+- **JSON stdout logs consumable by the admin UI.** Logs continue to be
+  written as JSON via `tracing_subscriber::fmt::json()`. In `memory`
+  backend mode a copy of that stream is parsed into an in-process
+  per-flow ring buffer (default 1000 entries per flow, configurable
+  via `backend.logs_per_flow`) exposed through the `LogsQuery` trait
+  the admin UI reads. In `remote` mode logs stay on stdout only —
+  operators plug in Fluent Bit / Vector / Grafana Alloy to forward
+  them to Loki, VictoriaLogs, Elasticsearch, or wherever.
+
+- **Backend-agnostic `LogsQuery` trait.** The web layer no longer
+  knows what backend serves its activity view; a memory
+  implementation ships today, remote backends (Loki, VictoriaLogs)
+  land in follow-up work through backend-specific crates.
+
+- **`telemetry.backend` tagged enum with per-backend fields.** The
+  `memory` variant accepts `logs_per_flow` and `metrics_per_flow`;
+  the `remote` variant accepts `endpoint`. Invalid combinations fail
+  at parse time.
+
+- **Per-invocation `task.handle` span on source tasks.** NATS
+  JetStream subscribers, Salesforce Pub/Sub subscribers, HTTP
+  endpoints, MCP handlers, the AI gateway LLM proxy, `git_sync`,
+  `oci_sync`, and `buffer` flushes now emit a `task.handle` span per
+  message / request / tick. The DAG duration badge and the activity
+  panel show live per-invocation timing for these tasks instead of
+  `—`.
+
+- **`duration_ms` backfilled onto every `task.handle` span.** The
+  activity layer records the elapsed wall-clock on the current
+  `task.handle` span via a `field::Empty` placeholder declared on
+  the `#[instrument]` macro. `tracing_subscriber::fmt::json()` then
+  includes it in the emitted `spans` array, so downstream consumers
+  (admin UI, log shippers, OTel span exporters) all see the same
+  per-event duration.
+
+- **Admin activity panel renders structured attributes.** Custom
+  tracing fields beyond the known system attributes (flow, task,
+  level, timestamp, event.id, duration_ms) now surface as a
+  key/value list under the message in the drawer. Context fields
+  attached via `EventLogger::context()` are serialized as a JSON
+  object so consumers can split them back into individual
+  attributes rather than parsing a joined string.
+
+- **Copy full log JSON from the activity drawer.** The drawer's
+  copy button now serializes the entire selected record — message,
+  timestamps, level, flow/task/processor, event id, duration, and
+  every extra attribute — into one JSON blob suitable for pasting
+  into tickets or chat.
+
+- **Explicit `activity = true` marker on every `task.handle` span.**
+  The admin activity feed filters on this marker so lifecycle logs
+  emitted from `task.run` scope (endpoint registration, resource
+  registration, startup traces) stay in stdout but do not clutter
+  the per-event UI. Errors and warnings that arise in the same
+  scope still surface — the marker only filters info-level noise.
+
+- **NATS `credentials_path` is now optional.** The `cache`,
+  `nats_kv_store`, `nats_jetstream_subscriber`, and
+  `nats_jetstream_publisher` config sections accept an omitted
+  `credentials_path`. When omitted, flowgen sends no credentials on
+  connect — the connection then succeeds only against a NATS server
+  that does not require authentication.
+
+- **Integration test coverage for NATS.** The `flowgen_nats` crate
+  gains `cache_integration`, `jetstream_integration`, and
+  `kv_store_integration` test suites that spin up a real NATS
+  JetStream server via testcontainers and exercise every method on
+  the `Cache` trait plus the publisher / subscriber / KV-store
+  processors. `flowgen` adds `init_cache_regression` covering the
+  unified `App::init_cache` code path against a real broker. All
+  integration tests are `#[ignore]`-gated and run in the
+  `test-integration` CI job with a single
+  `cargo test --workspace --tests -- --ignored` invocation.
+
+### Fixes
+
+- **k8s probes no longer 404.** During the earlier HTTP server
+  refactor from `flowgen_http::server` into
+  `flowgen_core::http_server` the previous `/healthz` handler was
+  lost, silently — probes returned 404 and pods crashlooped as soon
+  as the readiness `failureThreshold` was reached. Replaced with the
+  dedicated health listener above so the regression cannot recur:
+  even a service with every API listener disabled still answers
+  probes.
+
+- **`init_cache` unified between system + user cache paths.** The two
+  cache init call sites in `App` previously diverged on the
+  `history` / `tombstone_ttl` overrides. Both paths now go through a
+  single `App::init_cache` so per-tenant history overrides
+  (e.g. NATS KV's server-side cap of 64) apply uniformly and the
+  system cache no longer races with the runtime cache during
+  bootstrap.
+
+- **Default KV history dropped from 1000 → 64.** The NATS KV server
+  hard-caps per-subject history at 64; the previous default caused
+  `too long history` errors on real deploys. Callers that want fewer
+  retained versions can still lower the value via `cache.history`.
+
+- **`Cache::delete_with_revision` returns `RevisionMismatch` on
+  stale revisions.** The NATS backend used to fold every underlying
+  `UpdateError` into the generic `DeleteFailed` variant, so lease
+  release code that pattern-matched on `RevisionMismatch` never
+  detected loss of ownership. Mapping now mirrors what
+  `Cache::update` already did.
+
+## 0.124.0
+
+### Breaking
+
+- **`worker:` config namespace collapsed to the top level.** Flowgen ships
+  as a single binary — there is no separate worker/server split — so the
+  `worker: { http_server, mcp_server, ai_gateway, web, retry,
+  event_buffer_size }` grouping was misleading. These fields now live at
+  the root of the config alongside `cache`, `flows`, `resources`, and
+  `telemetry`. Migrate existing configs by unindenting one level and
+  removing the `worker:` header line.
+
+- **Node.js 22+ required to build from source.** `build.rs` in the
+  `flowgen` crate runs `npm ci && npm run build` in `web/` so a plain
+  `cargo build` produces a complete binary. Set
+  `FLOWGEN_SKIP_WEB_BUILD=1` to skip the UI build when working on
+  unrelated crates. Prebuilt binaries and Docker images are unaffected.
+
+### Features
+
+- **Admin web UI.** New embedded SvelteKit dashboard served by the
+  worker (opt-in via `web.enabled: true`). Lists loaded flows with
+  description, tags, status, and last-run timestamp; click a row to
+  preview the raw source YAML with Prism syntax highlighting.
+  Adds a Resources tab that browses everything under the configured
+  `resources.path` and renders `.md` files with `marked` plus code
+  files with Prism (SQL, YAML, JSON, Rhai, JS/TS, Bash, Python).
+  Sidebar layout with collapsible navigation, dark-mode toggle, and
+  the running flowgen version. Backend exposes read-only
+  `GET /api/flows`, `GET /api/flows/{name}`, `GET /api/resources`,
+  `GET /api/resources/{key}`, and `GET /api/version`.
+
+- **Flow labels: `description` and `tags`.** Flows can declare
+  `labels.description` (free-form string) and `labels.tags` (array of
+  strings) — surfaced on the admin UI so operators can categorize and
+  search loaded flows without reading the raw YAML.
+
+- **AI completion preserves upstream event meta.** `ai_completion`
+  used to overwrite `event.meta` with only the completion context
+  (provider, model, latency, usage), silently dropping any custom
+  fields upstream tasks had stashed via `ctx.meta.<field> = ...`.
+  The response now merges the completion context into the incoming
+  meta, so multi-step flows (script → ai_completion → downstream
+  script) can round-trip per-event state through the LLM turn.
+
+- **OpenAI content-parts array on the AI gateway.** The gateway's
+  `POST /v1/chat/completions` handler previously required
+  `messages[].content` to be a bare string; Rig, the OpenAI SDKs,
+  and several third-party clients emit the array form
+  (`[{"type":"text","text":"..."}]`) even for pure-text turns and
+  were rejected with a 422. `Message::content` now accepts either
+  shape and flattens the array back to a single string internally.
+
+### Helm chart (0.18.0)
+
+- **Opt-in `Service` blocks for `ai_gateway` and `web`.** Mirrors the
+  existing `mcp_server` pattern — commented out by default so no
+  extra Service is rendered unless the operator opts in. Both default
+  to `ClusterIP` when enabled.
+
+### Security
+
+- **Admin UI is unauthenticated.** The embedded `web` UI does not yet
+  ship with a login flow. Do not expose the admin port publicly.
+  Recommended access patterns:
+  - `kubectl port-forward svc/<release>-web 8080:8080` for one-off use.
+  - An authenticated reverse proxy (OAuth2-proxy, Cloudflare Access,
+    tailnet, etc.) in front of a `ClusterIP` Service for shared team
+    access.
+  The backend `/api/*` handlers are read-only; even so, they expose
+  loaded flow configs and resource contents which may include
+  templated secrets or query text.
+
+## 0.17.0
+
+### Helm chart
+
+- **`flowgen.podTemplate.merge` and `flowgen.podTemplate.patch` hooks** let
+  operators inject arbitrary pod spec fields without expanding the chart
+  surface. `merge` overrides top-level fields such as `hostNetwork` and
+  `dnsPolicy`; `patch` applies RFC 6902 JSON Patch operations to the
+  rendered pod spec. The `jsonpatch` helper is included in the chart and
+  follows the same convention used by the NATS Helm chart.
+
+- **Rendered-manifest tests for the chart.** New `flowgen-chart-tests`
+  workspace crate shells out to `helm template` and asserts on the
+  resulting Kubernetes manifests. Covers the `podTemplate.merge` and
+  `podTemplate.patch` hooks so regressions in the pod-spec injection
+  surface are caught in CI. Runs in a dedicated `test-helm-chart` job
+  that installs Helm alongside Rust; the crate is excluded from the
+  workspace `default-members` so `cargo test` at the root does not
+  require `helm` on `PATH`.
+
+## 0.123.0
+
+### Features
+
+- **`EventData::Bytes(bytes::Bytes)`** carries binary payloads through the
+  pipeline for content that cannot be safely coerced to UTF-8. Rendered as
+  a base64 string by `TryFrom<&EventData> for Value` so Handlebars
+  templates against `event.data` do not crash; downstream tasks that need
+  the raw bytes match `EventData::Bytes` directly.
+
+- **`http_request response_type: json | text | bytes`** picks how outbound
+  response bodies are decoded. Default remains `json` for backwards
+  compatibility. `bytes` emits `EventData::Bytes` — enables downloading
+  ZIP archives, image blobs, or other binary payloads without lossy UTF-8
+  coercion.
+
+- **`object_store::write` writes raw bytes.** New `WriteFormat::Bytes`
+  (auto-selected when the incoming event carries `EventData::Bytes`)
+  passes the payload through verbatim with a `.bin` extension.
+
+### Bug fixes
+
+- **`oci_sync` no longer rejects binary layers.** When a pulled layer
+  (or tar entry inside a layer) is not valid UTF-8, the processor emits
+  the bytes as `EventData::Bytes` with `path`, `digest`, and
+  `artifact_digest` on `event.meta`, instead of returning
+  `InvalidLayerEncoding` and failing the pull after retries. oras
+  layers holding UTF-8 content still emit the historical JSON
+  `FileEvent` shape so existing bootstrap flows are unaffected.
+
+- **`oci_sync` merges Docker image layers with overlay-fs semantics.**
+  Layers without the `org.opencontainers.image.title` annotation are
+  classified as Docker image layers and merged in manifest order: later
+  layers override earlier ones, `.wh.<name>` markers delete files from
+  lower layers, and `.wh..wh..opq` markers hide entire subtrees. Only
+  the surviving final state is emitted downstream. oras artifact
+  layers (carrying `image.title`) keep the per-layer emission
+  behaviour, so existing bootstrap flows are unaffected. Detection is
+  fully automatic — no config.
+
 ## 0.122.0
 
 ### Features

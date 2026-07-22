@@ -13,7 +13,6 @@ Create a file called `hello.yaml`:
 
 ```yaml
 flow:
-  name: hello_world
   tasks:
     - generate:
         name: ticker
@@ -57,7 +56,7 @@ cache:
   enabled: true
   type: nats
   credentials_path: /etc/nats/credentials.json
-  url: nats://localhost:4222
+  url: "{{env.NATS_URL}}"
   db_name: flowgen_cache
   # history: 10
   # tombstone_ttl: "1h"
@@ -79,28 +78,29 @@ resources:
   #   prefix: "resources."
   #   db_name: flowgen_system
 
-# OpenTelemetry metrics and tracing.
+# OpenTelemetry metrics, traces, and logs.
 # telemetry:
 #   enabled: true
-#   otlp_endpoint: "http://localhost:4317"
+#   backend:
+#     type: remote
+#     endpoint: "http://otel-collector:4317"
 #   service_name: flowgen
 #   metrics_export_interval: "60s"
 
-worker:
-  # HTTP server for webhooks, AI gateway, health checks.
-  http_server:
-    enabled: true
-    port: 3000
-    # path: "/api/flowgen/workers/v1"
-    # credentials_path: /etc/http/credentials.json
+# HTTP server for webhooks, AI gateway, health checks.
+http_server:
+  enabled: true
+  port: 3000
+  # path: "/api/flowgen/workers/v1"
+  # credentials_path: /etc/http/credentials.json
 
-  # MCP server for exposing flows as LLM tools.
-  # mcp_server:
-  #   enabled: true
-  #   port: 3001
-  #   path: "/mcp/v1"
+# MCP server for exposing flows as LLM tools.
+# mcp_server:
+#   enabled: true
+#   port: 3001
+#   path: "/mcp/v1"
 
-  # event_buffer_size: 10000
+# event_buffer_size: 10000
 ```
 
 Without cache configured, flowgen uses an in-memory cache (single-node). See [Caching](/docs/flowgen/concepts/caching) for details.

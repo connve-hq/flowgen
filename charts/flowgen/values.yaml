@@ -49,6 +49,24 @@ flowgen:
   # Termination grace period must be >= preStop sleep duration
   terminationGracePeriodSeconds: 45
 
+  # Optional merge/patch hooks for the Deployment's pod template.
+  # Use these to inject arbitrary pod spec fields (e.g. hostNetwork,
+  # dnsPolicy, topologySpreadConstraints) without expanding the chart
+  # surface for every possible option.
+  #
+  # Example:
+  #   podTemplate:
+  #     merge:
+  #       hostNetwork: true
+  #       dnsPolicy: ClusterFirstWithHostNet
+  #     patch:
+  #       - op: add
+  #         path: /nodeSelector/kubernetes.io~1os
+  #         value: linux
+  podTemplate:
+    merge: {}
+    patch: []
+
   securityContext:
     allowPrivilegeEscalation: false
     capabilities:
@@ -67,6 +85,25 @@ flowgen:
   # mcp_server:
   #   type: ClusterIP
   #   port: 3001
+
+  # AI gateway service configuration (optional).
+  # Only exposed when ai_gateway is enabled in the worker config.
+  # ai_gateway:
+  #   type: ClusterIP
+  #   port: 3002
+
+  # Admin web UI service configuration (optional).
+  # Only exposed when web is enabled in the worker config.
+  # web:
+  #   type: ClusterIP
+  #   port: 8080
+
+  # Kubernetes liveness/readiness listener. Independent from the API
+  # listeners so probes keep working regardless of which surfaces are
+  # enabled. Endpoints: /livez (always 200), /readyz (200 once >=1 flow
+  # is registered), /healthz (alias of /livez for pre-1.16 convention).
+  health:
+    port: 8081
 
   serviceAccount:
     # Specifies whether a service account should be created
@@ -93,7 +130,9 @@ flowgen:
     #       path: "/etc/app/resources"
     #     telemetry:
     #       enabled: true
-    #       otlp_endpoint: "http://otel-collector:4317"
+    #       backend:
+    #         type: remote
+    #         endpoint: "http://otel-collector:4317"
     #       service_name: "flowgen"
     #       metrics_export_interval: "60s"
     inline: ""

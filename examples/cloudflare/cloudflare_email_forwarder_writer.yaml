@@ -6,13 +6,16 @@
 # Required:
 #   - NATS credentials at /etc/nats/credentials.json
 flow:
-  name: cloudflare_email_forwarder_writer
+  labels:
+    display_name: "Cloudflare Email Writer (Inline Schema)"
+    description: "Consumes forwarded emails from NATS, converts JSON to Avro using an inline schema, and archives them to the object store partitioned by EventDate."
+    tags: ["cloudflare", "email", "nats", "object-store", "example"]
   tasks:
 
     - nats_jetstream_subscriber:
         name: start_subscription
         credentials_path: /etc/nats/credentials.json
-        url: "localhost:4222"
+        url: "{{env.NATS_URL}}"
         subject: email.received
         stream:
           create_or_update: true

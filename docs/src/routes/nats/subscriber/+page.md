@@ -8,7 +8,7 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 - nats_jetstream_subscriber:
     name: order_events
     credentials_path: /etc/nats/credentials.json
-    url: nats://localhost:4222
+    url: "{{env.NATS_URL}}"
     subject: "orders.>"
     durable_name: order_processor
     stream:
@@ -23,7 +23,7 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | required | Task name. |
-| `credentials_path` | string | required | Path to NATS credentials file. |
+| `credentials_path` | string | optional | Path to NATS credentials file. |
 | `url` | string | `localhost:4222` | NATS server URL. |
 | `subject` | string | required | Subject to subscribe to (supports wildcards). |
 | `durable_name` | string | | Durable consumer name for persistent subscriptions. |
@@ -62,7 +62,6 @@ Consumes messages from a NATS JetStream stream. Source task — typically first 
 
 ```yaml
 flow:
-  name: process_orders
   tasks:
     - nats_jetstream_subscriber:
         name: orders

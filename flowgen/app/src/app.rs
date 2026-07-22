@@ -1,10 +1,10 @@
-use crate::config::{AppConfig, FlowConfig};
+use crate::config::{AppConfig, FlowConfig, FlowConfigRaw};
 use config::Config;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
-use tracing::{debug, error, info, warn, Instrument};
+use tracing::{error, info, warn, Instrument};
 
 /// Tracks a running flow.
 ///
@@ -15,6 +15,29 @@ use tracing::{debug, error, info, warn, Instrument};
 /// entries the flow owns from the shared servers (via each server's own
 /// `deregister_flow(flow_name)`).
 pub struct FlowHandle {
+    /// Flow identity: the path-shaped key from the loader (filesystem-
+    /// relative or cache-key suffix), or `flow.name` when the flow was
+    /// constructed programmatically. Registry key, cache namespace,
+    /// activity keys, and log fields all derive from this.
+    pub identity: String,
+    /// Human-readable name extracted from `labels.display_name`. Falls back
+    /// to `identity` (or its basename) in UI when absent.
+    pub flow_display_name: Option<String>,
+    /// Optional description extracted from flow labels.
+    pub flow_description: Option<String>,
+    /// Tags extracted from `labels.tags` (empty when none).
+    pub flow_tags: Vec<String>,
+    /// Whether the flow requires leader election.
+    pub require_leader_election: bool,
+    /// Number of tasks in the flow.
+    pub task_count: usize,
+    /// Wall-clock time when the flow's supervisor was spawned. Surfaced on
+    /// the admin API as `last_run` until per-event tracking replaces it.
+    pub started_at: std::time::SystemTime,
+    /// YAML source of the flow config, serialized at registration time.
+    /// Surfaced on the admin API so operators can inspect the loaded flow
+    /// without shelling into the pod to `cat` the source file.
+    pub flow_yaml: String,
     /// Token used to signal the flow's tasks to stop gracefully.
     pub cancellation_token: tokio_util::sync::CancellationToken,
     /// Join handle for the flow's background monitor task spawned by `run()`.
@@ -30,6 +53,55 @@ pub struct FlowHandle {
     /// key, racing the replacement flow's renewer under the same pod-level
     /// holder identity.
     pub task_manager: Option<Arc<flowgen_core::task::manager::TaskManager>>,
+}
+
+impl FlowHandle {
+    /// Returns the flow identity (registry key, cache namespace, activity key).
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Returns the display name, if any.
+    pub fn display_name(&self) -> Option<&str> {
+        self.flow_display_name.as_deref()
+    }
+
+    /// Returns the flow description, if any.
+    pub fn description(&self) -> Option<&str> {
+        self.flow_description.as_deref()
+    }
+
+    /// Returns the flow tags (empty when none).
+    pub fn tags(&self) -> &[String] {
+        &self.flow_tags
+    }
+
+    /// Returns true if the flow requires leader election.
+    pub fn require_leader_election(&self) -> bool {
+        self.require_leader_election
+    }
+
+    /// Returns the number of tasks in the flow.
+    pub fn task_count(&self) -> usize {
+        self.task_count
+    }
+
+    /// YAML source of the flow config.
+    pub fn flow_yaml(&self) -> &str {
+        &self.flow_yaml
+    }
+
+    /// Wall-clock start time of the flow's supervisor task.
+    pub fn started_at(&self) -> std::time::SystemTime {
+        self.started_at
+    }
+
+    /// True when the flow's supervisor is still executing. A `false` here
+    /// means the flow has exited (usually via an unhandled task panic or
+    /// error), so callers can surface it as an `error` status.
+    pub fn is_running(&self) -> bool {
+        !self.join_handle.is_finished()
+    }
 }
 
 /// Errors that can occur during application execution.
@@ -200,25 +272,57 @@ pub enum Error {
 pub struct App {
     /// Global application configuration.
     pub config: AppConfig,
+    /// Shared FlowRegistry populated by the tracing activity layer, read
+    /// by the admin web API for status and SSE.
+    pub flow_activity: Arc<flowgen_core::flow::activity::FlowRegistry>,
+    /// Cache backing flow/resource storage, activity publish, and runtime
+    /// state. Built in `main` before tracing so `FlowRegistry` can be
+    /// constructed with a real cache reference from the outset.
+    pub cache: Arc<dyn flowgen_core::cache::Cache>,
+    /// Backend-agnostic log query source used by the admin web API for
+    /// history queries and SSE tail. `None` when the selected telemetry
+    /// backend does not (yet) expose a query surface.
+    pub logs_query: Option<Arc<dyn flowgen_core::telemetry::query::LogsQuery>>,
 }
 
 impl App {
-    /// Initializes a system cache connection for flow/resource loading.
-    /// Separate from the runtime cache to avoid key collisions during list operations.
-    fn init_system_cache(
+    /// Builds the runtime cache from config (NATS if enabled and reachable,
+    /// otherwise in-memory). Callable before tracing is up so `main` can
+    /// hand a real cache to `FlowRegistry::builder().cache(...)`.
+    pub async fn init_cache(
         app_config: &AppConfig,
-        db_name: &str,
+        db_name: Option<&str>,
     ) -> Result<Arc<dyn flowgen_core::cache::Cache>, Error> {
-        let cache_config = app_config.cache.as_ref().ok_or(Error::InvalidFlowsPath)?;
-
-        let nats_cache = flowgen_nats::cache::CacheBuilder::new()
-            .credentials_path(cache_config.credentials_path.clone())
-            .url(cache_config.url.clone())
-            .build()
-            .and_then(|builder| futures::executor::block_on(async { builder.init(db_name).await }))
-            .map_err(|source| Error::SystemCacheInit { source })?;
-
-        Ok(Arc::new(nats_cache))
+        let Some(cache_config) = &app_config.cache else {
+            return Ok(Arc::new(flowgen_core::cache::memory::MemoryCache::new()));
+        };
+        if !cache_config.enabled {
+            return Ok(Arc::new(flowgen_core::cache::memory::MemoryCache::new()));
+        }
+        let db_name = db_name.unwrap_or_else(|| {
+            cache_config
+                .db_name
+                .as_deref()
+                .unwrap_or(crate::config::DEFAULT_CACHE_DB_NAME)
+        });
+        let mut cache_builder =
+            flowgen_nats::cache::CacheBuilder::new().url(cache_config.url.clone());
+        if let Some(path) = cache_config.credentials_path.clone() {
+            cache_builder = cache_builder.credentials_path(path);
+        }
+        if let Some(history) = cache_config.history {
+            cache_builder = cache_builder.history(history);
+        }
+        if let Some(ttl) = cache_config.tombstone_ttl {
+            cache_builder = cache_builder.tombstone_ttl(ttl);
+        }
+        match cache_builder.build() {
+            Ok(builder) => match builder.init(db_name).await {
+                Ok(nats_cache) => Ok(Arc::new(nats_cache)),
+                Err(e) => Err(Error::SystemCacheInit { source: e }),
+            },
+            Err(e) => Err(Error::SystemCacheInit { source: e }),
+        }
     }
 
     /// Loads flow configurations from a system cache bucket.
@@ -269,18 +373,39 @@ impl App {
                     source,
                 })?;
 
-            match config.try_deserialize::<FlowConfig>() {
-                Ok(flow_config) => {
-                    if let Err(reason) = flow_config.validate() {
-                        error!(
-                            key = %key,
-                            error = %reason,
-                            "Flow config from cache failed name validation, skipping"
-                        );
-                        continue;
+            match config.try_deserialize::<FlowConfigRaw>() {
+                Ok(raw) => {
+                    let identity_path = match key
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_prefix('.'))
+                    {
+                        Some(p) => p.to_string(),
+                        None => {
+                            error!(
+                                key = %key,
+                                prefix = %prefix,
+                                "Cache key does not start with the configured prefix, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    match FlowConfig::from_path(raw, identity_path, Some(content.clone())) {
+                        Ok(flow_config) => {
+                            info!(
+                                flow = %flow_config.identity(),
+                                key = %key,
+                                "Loaded flow from cache",
+                            );
+                            flow_configs.push((key, flow_config));
+                        }
+                        Err(reason) => {
+                            error!(
+                                key = %key,
+                                error = %reason,
+                                "Flow config from cache failed validation, skipping"
+                            );
+                        }
                     }
-                    info!(flow = %flow_config.flow.name, key = %key, "Loaded flow from cache");
-                    flow_configs.push((key, flow_config));
                 }
                 Err(source) => {
                     error!(
@@ -308,6 +433,15 @@ impl App {
         };
 
         let flows_path_str = flows_path.to_str().ok_or(Error::InvalidFlowsPath)?;
+
+        // Root is the longest non-wildcard prefix — canonicalized once so we
+        // can compute a stable relative `source_path` per flow.
+        let root_str: String = flows_path_str
+            .split('/')
+            .take_while(|seg| !seg.contains('*'))
+            .collect::<Vec<_>>()
+            .join("/");
+        let source_root = std::fs::canonicalize(&root_str).ok();
 
         // Check if path contains wildcards (backward compatibility).
         let glob_patterns: Vec<String> = if flows_path_str.contains('*') {
@@ -377,18 +511,42 @@ impl App {
                             }
                         };
 
-                        match config.try_deserialize::<FlowConfig>() {
-                            Ok(flow_config) => {
-                                if let Err(reason) = flow_config.validate() {
-                                    error!(
-                                        path = %path.display(),
-                                        error = %reason,
-                                        "Flow config failed name validation, skipping this flow"
-                                    );
-                                    return None;
+                        match config.try_deserialize::<FlowConfigRaw>() {
+                            Ok(raw) => {
+                                let identity_path = match compute_source_path(
+                                    &canonical_path,
+                                    source_root.as_deref(),
+                                ) {
+                                    Some(p) => p,
+                                    None => {
+                                        error!(
+                                            path = %path.display(),
+                                            "Cannot derive flow identity from path (outside `flows.path` or missing root), skipping this flow"
+                                        );
+                                        return None;
+                                    }
+                                };
+                                match FlowConfig::from_path(
+                                    raw,
+                                    identity_path,
+                                    Some(contents),
+                                ) {
+                                    Ok(flow_config) => {
+                                        info!(
+                                            flow = %flow_config.identity(),
+                                            "Loaded flow",
+                                        );
+                                        Some(flow_config)
+                                    }
+                                    Err(reason) => {
+                                        error!(
+                                            path = %path.display(),
+                                            error = %reason,
+                                            "Flow config failed validation, skipping this flow"
+                                        );
+                                        None
+                                    }
                                 }
-                                info!(flow = %flow_config.flow.name, "Loaded flow");
-                                Some(flow_config)
                             }
                             Err(source) => {
                                 let err = Error::FlowConfigDeserialize {
@@ -424,34 +582,6 @@ impl App {
     pub async fn start(self, shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> Result<(), Error> {
         let app_config = Arc::new(self.config);
 
-        // Initialize OpenTelemetry if configured.
-        let _telemetry_guard = if let Some(telemetry_config) = &app_config.telemetry {
-            if telemetry_config.enabled {
-                let config = flowgen_core::telemetry::TelemetryConfig {
-                    otlp_endpoint: telemetry_config.otlp_endpoint.clone(),
-                    service_name: telemetry_config.service_name.clone(),
-                    service_version: env!("CARGO_PKG_VERSION").to_string(),
-                    metrics_export_interval_secs: telemetry_config
-                        .metrics_export_interval
-                        .as_secs(),
-                };
-                match flowgen_core::telemetry::init_telemetry(config) {
-                    Ok(guard) => {
-                        debug!("OpenTelemetry initialized successfully");
-                        Some(guard)
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to initialize OpenTelemetry, continuing without metrics");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // Load flows from filesystem and (optionally) from the distributed cache.
         // The two sources are merged so a worker can run any combination of:
         //   - filesystem only (no cache section, classic mode);
@@ -466,7 +596,7 @@ impl App {
 
         let (cache_flows, system_cache) = match app_config.flows.cache.as_ref() {
             Some(cache_opts) if cache_opts.enabled => {
-                match Self::init_system_cache(&app_config, &cache_opts.db_name) {
+                match Self::init_cache(&app_config, Some(&cache_opts.db_name)).await {
                     Ok(cache) => {
                         info!(
                             "Initialized system cache for flow loading on bucket '{}'.",
@@ -487,19 +617,22 @@ impl App {
         };
 
         let mut flow_configs = filesystem_flows;
-        // Record filesystem flow names before merging so the reconciler can enforce
-        // the invariant that cache reload events never overwrite filesystem flows.
-        let filesystem_flow_names: HashSet<String> =
-            flow_configs.iter().map(|f| f.flow.name.clone()).collect();
-        let mut seen_names = filesystem_flow_names.clone();
+        // Record filesystem flow identities (path-shaped) before merging so the
+        // reconciler can enforce the invariant that cache reload events never
+        // overwrite filesystem flows.
+        let filesystem_flow_paths: HashSet<String> = flow_configs
+            .iter()
+            .map(|f| f.identity().to_string())
+            .collect();
+        let mut seen_paths = filesystem_flow_paths.clone();
         for (cache_key, cache_flow) in cache_flows {
-            if seen_names.insert(cache_flow.flow.name.clone()) {
+            if seen_paths.insert(cache_flow.identity().to_string()) {
                 flow_configs.push(cache_flow);
             } else {
                 warn!(
-                    flow = %cache_flow.flow.name,
+                    flow = %cache_flow.identity(),
                     key = %cache_key,
-                    "Cache flow shadowed by a filesystem flow with the same name, deleting stale cache entry"
+                    "Cache flow shadowed by a filesystem flow with the same identity, deleting stale cache entry"
                 );
                 if let Some((ref cache, _)) = system_cache {
                     if let Err(e) = cache.delete(&cache_key).await {
@@ -514,36 +647,32 @@ impl App {
         }
 
         // Create shared webhook HTTP server if enabled.
-        let http_server: Option<Arc<flowgen_http::server::EndpointServer>> = match app_config
-            .worker
-            .as_ref()
-            .and_then(|w| w.http_server.as_ref())
-        {
-            Some(http_config) if http_config.enabled => {
-                let path = http_config.path.clone();
-                let auth_provider = match http_config.auth.clone() {
-                    Some(auth_config) => Some(
-                        auth_config
-                            .build()
-                            .await
-                            .map_err(|source| Error::AuthProviderInit { source })?,
-                    ),
-                    None => None,
-                };
-                let server = flowgen_core::http_server::HttpServer::<
-                    flowgen_http::server::EndpointDispatcher,
-                >::new(path)
-                .with_credentials_path(http_config.credentials_path.clone())
-                .with_auth_provider(auth_provider);
-                Some(Arc::new(server))
-            }
-            _ => None,
-        };
+        let http_server: Option<Arc<flowgen_http::server::EndpointServer>> =
+            match app_config.http_server.as_ref() {
+                Some(http_config) if http_config.enabled => {
+                    let path = http_config.path.clone();
+                    let auth_provider = match http_config.auth.clone() {
+                        Some(auth_config) => Some(
+                            auth_config
+                                .build()
+                                .await
+                                .map_err(|source| Error::AuthProviderInit { source })?,
+                        ),
+                        None => None,
+                    };
+                    let server = flowgen_core::http_server::HttpServer::<
+                        flowgen_http::server::EndpointDispatcher,
+                    >::new(path)
+                    .with_credentials_path(http_config.credentials_path.clone())
+                    .with_auth_provider(auth_provider);
+                    Some(Arc::new(server))
+                }
+                _ => None,
+            };
 
         let mcp_enabled = app_config
-            .worker
+            .mcp_server
             .as_ref()
-            .and_then(|w| w.mcp_server.as_ref())
             .map(|mcp| mcp.enabled)
             .unwrap_or(false);
 
@@ -563,10 +692,7 @@ impl App {
         }
 
         let mcp_server: Option<Arc<flowgen_mcp::server::McpServer>> = if mcp_enabled {
-            let mcp_config = app_config
-                .worker
-                .as_ref()
-                .and_then(|w| w.mcp_server.as_ref());
+            let mcp_config = app_config.mcp_server.as_ref();
             // Load MCP credentials if configured.
             let credentials = mcp_config
                 .and_then(|mcp_config| mcp_config.credentials_path.as_ref())
@@ -626,22 +752,18 @@ impl App {
                 .any(|t| matches!(t, crate::config::TaskType::llm_proxy(_)))
         });
         let ai_gateway_enabled = app_config
-            .worker
+            .ai_gateway
             .as_ref()
-            .and_then(|w| w.ai_gateway.as_ref())
             .map(|g| g.enabled)
             .unwrap_or(false);
 
         if has_ai_gateway_tasks && !ai_gateway_enabled {
-            warn!("Flows contain llm_proxy tasks but worker.ai_gateway is not enabled, LLM proxy endpoints will not be registered");
+            warn!("Flows contain llm_proxy tasks but ai_gateway is not enabled, LLM proxy endpoints will not be registered");
         }
 
         let ai_gateway_server: Option<Arc<flowgen_ai_agent::ai_gateway::server::AiGatewayServer>> =
             if ai_gateway_enabled {
-                let ai_config = app_config
-                    .worker
-                    .as_ref()
-                    .and_then(|w| w.ai_gateway.as_ref());
+                let ai_config = app_config.ai_gateway.as_ref();
                 let path = ai_config.map(|c| c.path.clone()).unwrap_or_else(|| {
                     flowgen_ai_agent::ai_gateway::server::DEFAULT_AI_GATEWAY_PATH.to_string()
                 });
@@ -671,47 +793,7 @@ impl App {
                 None
             };
 
-        let cache: Arc<dyn flowgen_core::cache::Cache> = if let Some(cache_config) =
-            &app_config.cache
-        {
-            if cache_config.enabled {
-                let db_name = cache_config
-                    .db_name
-                    .as_deref()
-                    .unwrap_or(crate::config::DEFAULT_CACHE_DB_NAME);
-
-                let mut cache_builder = flowgen_nats::cache::CacheBuilder::new()
-                    .credentials_path(cache_config.credentials_path.clone())
-                    .url(cache_config.url.clone());
-                if let Some(history) = cache_config.history {
-                    cache_builder = cache_builder.history(history);
-                }
-                if let Some(ttl) = cache_config.tombstone_ttl {
-                    cache_builder = cache_builder.tombstone_ttl(ttl);
-                }
-                match cache_builder.build().and_then(|builder| {
-                    futures::executor::block_on(async { builder.init(db_name).await })
-                }) {
-                    Ok(nats_cache) => {
-                        info!("Using NATS distributed cache");
-                        Arc::new(nats_cache) as Arc<dyn flowgen_core::cache::Cache>
-                    }
-                    Err(e) => {
-                        warn!("Failed to connect to NATS, falling back to in-memory cache: {e}");
-                        Arc::new(flowgen_core::cache::memory::MemoryCache::new())
-                            as Arc<dyn flowgen_core::cache::Cache>
-                    }
-                }
-            } else {
-                info!("Cache disabled in config, using in-memory cache");
-                Arc::new(flowgen_core::cache::memory::MemoryCache::new())
-                    as Arc<dyn flowgen_core::cache::Cache>
-            }
-        } else {
-            info!("No cache configured, using in-memory cache");
-            Arc::new(flowgen_core::cache::memory::MemoryCache::new())
-                as Arc<dyn flowgen_core::cache::Cache>
-        };
+        let cache = Arc::clone(&self.cache);
 
         // Build the resource loader. Filesystem and cache sources are
         // independent: configure either, both, or neither. When both are
@@ -731,7 +813,7 @@ impl App {
                         {
                             system_cache.as_ref().map(|(c, _)| c.clone())
                         } else {
-                            match Self::init_system_cache(&app_config, &rc.db_name) {
+                            match Self::init_cache(&app_config, Some(&rc.db_name)).await {
                                 Ok(cache) => {
                                     info!(
                                         "Initialized system cache for resource loading on bucket '{}'.",
@@ -810,12 +892,11 @@ impl App {
                 flow_builder = flow_builder.ai_gateway_server(Arc::clone(server));
             }
 
-            if let Some(retry_config) = app_config.worker.as_ref().and_then(|w| w.retry.as_ref()) {
+            if let Some(retry_config) = app_config.retry.as_ref() {
                 flow_builder = flow_builder.retry(retry_config.clone());
             }
 
-            if let Some(buffer_size) = app_config.worker.as_ref().and_then(|w| w.event_buffer_size)
-            {
+            if let Some(buffer_size) = app_config.event_buffer_size {
                 flow_builder = flow_builder.event_buffer_size(buffer_size);
             }
 
@@ -877,9 +958,8 @@ impl App {
         let mut background_handles = Vec::new();
         if let Some(ref http_server) = http_server {
             let configured_port = app_config
-                .worker
+                .http_server
                 .as_ref()
-                .and_then(|w| w.http_server.as_ref())
                 .map(|http| http.port)
                 .unwrap_or(flowgen_http::server::DEFAULT_ENDPOINT_PORT);
             info!(port = configured_port, path = %http_server.path(), "Starting HTTP server");
@@ -899,9 +979,8 @@ impl App {
 
         if let Some(ref mcp_server) = mcp_server {
             let configured_port = app_config
-                .worker
+                .mcp_server
                 .as_ref()
-                .and_then(|w| w.mcp_server.as_ref())
                 .map(|c| c.port)
                 .unwrap_or(flowgen_mcp::server::DEFAULT_MCP_PORT);
             info!(port = configured_port, path = %mcp_server.path(), "Starting MCP server");
@@ -920,9 +999,8 @@ impl App {
 
         if let Some(ref ai_gateway_server) = ai_gateway_server {
             let configured_port = app_config
-                .worker
+                .ai_gateway
                 .as_ref()
-                .and_then(|w| w.ai_gateway.as_ref())
                 .map(|c| c.port)
                 .unwrap_or(flowgen_ai_agent::ai_gateway::server::DEFAULT_AI_GATEWAY_PORT);
             info!(port = configured_port, path = %ai_gateway_server.path(), "Starting AI gateway server");
@@ -950,8 +1028,52 @@ impl App {
 
         // Start all background flow tasks and populate the registry.
         for flow in flows {
-            let flow_name = flow.name().to_string();
-            let from_filesystem = filesystem_flow_names.contains(&flow_name);
+            let identity = flow.identity().to_string();
+            let from_filesystem = filesystem_flow_paths.contains(&identity);
+            let flow_display_name = flow
+                .config
+                .flow
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("display_name"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            let flow_description = flow
+                .config
+                .flow
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("description"))
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            let flow_tags = flow
+                .config
+                .flow
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("tags"))
+                .and_then(|value| value.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let require_leader_election = flow.config.flow.require_leader_election.unwrap_or(false);
+            let task_count = flow.config.flow.tasks.len();
+            let flow_yaml = match flow.config.raw_source.clone() {
+                Some(source) => source,
+                None => match serde_yaml::to_string(&*flow.config) {
+                    Ok(yaml) => yaml,
+                    Err(source) => {
+                        warn!(
+                            error = %source,
+                            "Failed to serialize flow config to YAML for admin API"
+                        );
+                        String::new()
+                    }
+                },
+            };
 
             let cancellation_token = flow
                 .cancellation_token()
@@ -963,8 +1085,16 @@ impl App {
 
             if let Ok(mut registry) = flow_registry.write() {
                 registry.insert(
-                    flow_name,
+                    identity.clone(),
                     FlowHandle {
+                        identity,
+                        flow_display_name,
+                        flow_description,
+                        flow_tags,
+                        require_leader_election,
+                        task_count,
+                        started_at: std::time::SystemTime::now(),
+                        flow_yaml,
                         cancellation_token,
                         join_handle,
                         from_filesystem,
@@ -972,6 +1102,47 @@ impl App {
                     },
                 );
             }
+        }
+
+        // Start the admin web UI if enabled.
+        let web_config = app_config.web.as_ref();
+        if let Some(web_config) = web_config.filter(|w| w.enabled) {
+            let port = web_config.port;
+            let path = web_config.path.clone();
+            let web_state = crate::web::WebState {
+                flow_registry: Arc::clone(&flow_registry),
+                prefix: String::new(),
+                resource_loader: resource_loader.clone(),
+                flow_activity: Arc::clone(&self.flow_activity),
+                logs_query: self.logs_query.clone(),
+                app_config: Arc::clone(&app_config),
+            };
+            let web_handle = tokio::spawn(async move {
+                if let Err(source) = crate::web::start_web_server(port, &path, web_state).await {
+                    error!("{}", source);
+                }
+            });
+            background_handles.push(web_handle);
+        }
+
+        // Start the dedicated k8s health listener. Readiness reports true once
+        // at least one flow is registered; liveness is always 200.
+        if app_config.health.enabled {
+            let port = app_config.health.port;
+            let registry_for_health = Arc::clone(&flow_registry);
+            let readiness: flowgen_core::health::ReadinessCheck =
+                Arc::new(move || match registry_for_health.read() {
+                    Ok(guard) => !guard.is_empty(),
+                    Err(_) => false,
+                });
+            let health_handle = tokio::spawn(async move {
+                if let Err(source) =
+                    flowgen_core::health::start_health_server(port, readiness).await
+                {
+                    error!("{}", source);
+                }
+            });
+            background_handles.push(health_handle);
         }
 
         // Spawn the hot-reload watcher and reconciler if the system cache supports watching.
@@ -999,7 +1170,7 @@ impl App {
                 http_server: http_server.clone(),
                 mcp_server: mcp_server.clone(),
                 ai_gateway_server: ai_gateway_server.clone(),
-                filesystem_flow_names: Arc::new(filesystem_flow_names.clone()),
+                filesystem_flow_paths: Arc::new(filesystem_flow_paths.clone()),
                 flow_registry: Arc::clone(&flow_registry),
                 client_registry: Arc::clone(&client_registry),
             };
@@ -1051,5 +1222,75 @@ impl App {
 
         info!("Shutdown complete, all flows stopped and leases released");
         Ok(())
+    }
+}
+
+/// Computes the identity of a filesystem-loaded flow: path relative to
+/// `source_root`, extension stripped, slashes normalized to `/`. Returns
+/// `None` when the file lies outside `source_root` or when either input
+/// is missing — callers use the fallback identity in that case.
+fn compute_source_path(
+    canonical_file: &std::path::Path,
+    source_root: Option<&std::path::Path>,
+) -> Option<String> {
+    let root = source_root?;
+    let rel = canonical_file.strip_prefix(root).ok()?;
+    let mut s = rel.with_extension("").to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        return None;
+    }
+    // Trim any leading `./` the strip could leave behind.
+    if let Some(rest) = s.strip_prefix("./") {
+        s = rest.to_string();
+    }
+    Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn compute_source_path_strips_root_and_extension() {
+        let root = PathBuf::from("/etc/flows");
+        let file = PathBuf::from("/etc/flows/demo/nba_email_demo.yaml");
+        assert_eq!(
+            compute_source_path(&file, Some(&root)),
+            Some("demo/nba_email_demo".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_source_path_flat_layout() {
+        let root = PathBuf::from("/etc/flows");
+        let file = PathBuf::from("/etc/flows/single.yml");
+        assert_eq!(
+            compute_source_path(&file, Some(&root)),
+            Some("single".to_string())
+        );
+    }
+
+    #[test]
+    fn compute_source_path_returns_none_when_outside_root() {
+        let root = PathBuf::from("/etc/flows");
+        let file = PathBuf::from("/tmp/elsewhere/flow.yaml");
+        assert!(compute_source_path(&file, Some(&root)).is_none());
+    }
+
+    #[test]
+    fn compute_source_path_returns_none_without_root() {
+        let file = PathBuf::from("/etc/flows/x.yaml");
+        assert!(compute_source_path(&file, None).is_none());
+    }
+
+    #[test]
+    fn compute_source_path_deeply_nested() {
+        let root = PathBuf::from("/repo/flows");
+        let file = PathBuf::from("/repo/flows/a/b/c/deep.json");
+        assert_eq!(
+            compute_source_path(&file, Some(&root)),
+            Some("a/b/c/deep".to_string())
+        );
     }
 }

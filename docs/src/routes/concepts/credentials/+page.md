@@ -32,7 +32,7 @@ The most common shared format is `HttpCredentials`, used by `http_endpoint`, `ht
 
 ```json
 {
-  "bearer_auth": "your-token-here"
+  "bearer_auth": "your-password"
 }
 ```
 
@@ -41,8 +41,8 @@ Or basic auth:
 ```json
 {
   "basic_auth": {
-    "username": "your-user",
-    "password": "your-pass"
+    "username": "your-username",
+    "password": "your-password"
   }
 }
 ```
@@ -55,7 +55,7 @@ Both fields are optional. If neither is set, no `Authorization` header is added.
 
 ```json
 {
-  "bearer_auth": "shh-my-secret"
+  "bearer_auth": "your-password"
 }
 ```
 
@@ -63,7 +63,6 @@ Both fields are optional. If neither is set, no `Authorization` header is added.
 
 ```yaml
 flow:
-  name: secure_webhook
   tasks:
     - http_endpoint:
         name: ingest
@@ -72,26 +71,25 @@ flow:
         credentials_path: /etc/flowgen/credentials/webhook.json
 ```
 
-Incoming requests must include `Authorization: Bearer shh-my-secret`. Anything else returns 401.
+Incoming requests must include `Authorization: Bearer your-password`. Anything else returns 401.
 
-## Worker-level fallback for HTTP
+## Server-level fallback for HTTP
 
-The HTTP server has a worker-level credentials path that webhooks can inherit:
+The HTTP server has a shared credentials path that webhooks can inherit:
 
 ```yaml
-worker:
-  http_server:
-    enabled: true
-    credentials_path: /etc/flowgen/credentials/http.json
+http_server:
+  enabled: true
+  credentials_path: /etc/flowgen/credentials/http.json
 ```
 
-Individual `http_endpoint` tasks override the worker default by setting their own `credentials_path`. This is useful when most webhooks share the same shared-secret token but a few endpoints have stricter requirements.
+Individual `http_endpoint` tasks override the shared default by setting their own `credentials_path`. This is useful when most webhooks share the same shared-secret token but a few endpoints have stricter requirements.
 
 ## User-level authentication is separate
 
-`credentials_path` authenticates the task itself (e.g., the bearer token for incoming webhook requests). User-level authentication — JWT, OIDC, session tokens — happens via the worker's `auth` configuration. See [Authentication](/docs/flowgen/concepts/auth).
+`credentials_path` authenticates the task itself (e.g., the bearer token for incoming webhook requests). User-level authentication — JWT, OIDC, session tokens — happens via the server's `auth` configuration. See [Authentication](/docs/flowgen/concepts/auth).
 
-The two compose: a webhook can require a worker-level shared secret (via `credentials_path`) **and** a user-level JWT (via `auth.required: true`). Both checks must pass.
+The two compose: a webhook can require a shared secret (via `credentials_path`) **and** a user-level JWT (via `auth.required: true`). Both checks must pass.
 
 ## Connection pooling
 

@@ -19,19 +19,139 @@ pub const DEFAULT_CACHE_DB_NAME: &str = "flowgen_cache";
 /// Supported flow configuration file extensions for recursive discovery.
 pub const FLOW_CONFIG_EXTENSIONS: &[&str] = &["yaml", "yml", "json"];
 
-/// Top-level configuration for an individual flow.
+/// Identity source of a flow.
+///
+/// A flow always has exactly one identity, established at construction:
+/// either the path relative to `flows.path` (filesystem-loaded or cache-
+/// key-derived), or the programmatic `name` from an API-constructed flow.
+/// Encoding it as an enum keeps the invariant in the type — there is no
+/// "neither is set" state to guard against at read time.
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub enum FlowIdentity {
+    /// Path relative to `flows.path` (filesystem load) or KV key suffix
+    /// after `flowgen.flows.` (cache load), extension stripped, slashes
+    /// preserved for folder grouping in the UI.
+    Path(String),
+    /// Programmatic name supplied when a flow is constructed via the
+    /// admin API rather than from a filesystem/cache path.
+    Name(String),
+}
+
+impl FlowIdentity {
+    /// Returns the identity string used as the registry key, cache
+    /// namespace, MCP URI, and tracing `flow=` field.
+    pub fn as_str(&self) -> &str {
+        match self {
+            FlowIdentity::Path(p) => p,
+            FlowIdentity::Name(n) => n,
+        }
+    }
+}
+
+/// Deserialization surface for a flow YAML file.
+///
+/// Public API is [`FlowConfig`] — `FlowConfigRaw` exists only because
+/// serde cannot construct a [`FlowIdentity`] without knowing whether the
+/// caller is loading from a filesystem path or the cache. The loader
+/// wraps this into a `FlowConfig` via [`FlowConfig::from_path`] or
+/// [`FlowConfig::from_name`], both of which enforce the identity
+/// invariant.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
-pub struct FlowConfig {
-    /// Flow definition containing name and tasks.
+pub struct FlowConfigRaw {
+    /// Flow definition (tasks and optional labels).
     pub flow: Flow,
 }
 
+/// Top-level configuration for an individual flow.
+///
+/// Construct via [`FlowConfig::from_path`] (filesystem/cache load) or
+/// [`FlowConfig::from_name`] (programmatic). Deserialize the YAML into
+/// [`FlowConfigRaw`] first, then wrap it with the appropriate factory.
+#[derive(PartialEq, Clone, Debug, Serialize)]
+pub struct FlowConfig {
+    /// Flow definition (tasks and optional labels).
+    pub flow: Flow,
+    /// Verbatim YAML source the loader read this flow from. Kept for the
+    /// admin API so the UI can render the file as authored — round-tripping
+    /// through `serde_yaml` introduces enum tags and `null` sentinels for
+    /// `Option::None` fields, which is not what an operator wants to see.
+    #[serde(skip)]
+    pub raw_source: Option<String>,
+    /// Flow identity, established at construction. Never mutated after.
+    #[serde(skip)]
+    identity: FlowIdentity,
+}
+
 impl FlowConfig {
-    /// Validates flow and task names so they are safe to use as filesystem
-    /// path segments. Called by the loaders before a flow is accepted.
-    pub fn validate(&self) -> Result<(), flowgen_core::validate::Error> {
+    /// Builds a `FlowConfig` for a flow loaded from a filesystem path or
+    /// cache key. `path` is the identity string (already relative to
+    /// `flows.path` with extension stripped, or the KV key suffix).
+    /// Validates task names.
+    pub fn from_path(
+        raw: FlowConfigRaw,
+        path: String,
+        raw_source: Option<String>,
+    ) -> Result<Self, flowgen_core::validate::Error> {
+        let config = Self {
+            flow: raw.flow,
+            raw_source,
+            identity: FlowIdentity::Path(path),
+        };
+        config.validate_tasks()?;
+        Ok(config)
+    }
+
+    /// Builds a `FlowConfig` for a flow constructed programmatically
+    /// (e.g. via the admin API). `raw.flow.name` must be set.
+    pub fn from_name(
+        raw: FlowConfigRaw,
+        raw_source: Option<String>,
+    ) -> Result<Self, flowgen_core::validate::Error> {
         use flowgen_core::validate::{validate_name, NameField};
-        validate_name(NameField::Flow, &self.flow.name)?;
+        let name = match &raw.flow.name {
+            Some(n) => n.clone(),
+            None => return Err(flowgen_core::validate::Error::MissingFlowIdentity),
+        };
+        validate_name(NameField::Flow, &name)?;
+        let config = Self {
+            flow: raw.flow,
+            raw_source,
+            identity: FlowIdentity::Name(name),
+        };
+        config.validate_tasks()?;
+        Ok(config)
+    }
+
+    /// Returns the flow identity: path when loaded from filesystem/cache,
+    /// programmatic name when API-constructed. Used as the registry key,
+    /// cache namespace, MCP URI, and tracing `flow=` field.
+    pub fn identity(&self) -> &str {
+        self.identity.as_str()
+    }
+
+    /// Returns the identity variant. Callers that need to distinguish
+    /// path-loaded flows from programmatic flows (e.g. UI badges) match
+    /// on this; the identity string alone is enough for keying.
+    pub fn identity_variant(&self) -> &FlowIdentity {
+        &self.identity
+    }
+
+    /// Returns the human-facing display name: `flow.name` when set,
+    /// otherwise the basename of the identity path. Used for UI lists
+    /// and log fields — never for keying.
+    pub fn display_name(&self) -> &str {
+        match (self.flow.name.as_deref(), &self.identity) {
+            (Some(name), _) => name,
+            (None, FlowIdentity::Name(n)) => n,
+            (None, FlowIdentity::Path(p)) => match p.rsplit('/').next() {
+                Some(basename) => basename,
+                None => p,
+            },
+        }
+    }
+
+    fn validate_tasks(&self) -> Result<(), flowgen_core::validate::Error> {
+        use flowgen_core::validate::{validate_name, NameField};
         for task in &self.flow.tasks {
             validate_name(NameField::Task, task.name())?;
         }
@@ -44,11 +164,18 @@ fn default_parallel_instances() -> usize {
     1
 }
 
-/// Flow definition with name and task list.
+/// Flow definition with task list. Identity normally comes from the
+/// file path relative to `flows.path`; `name` is only meaningful when
+/// a flow is constructed programmatically (e.g. via the admin API)
+/// without a filesystem path to derive from.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct Flow {
-    /// Unique name for this flow.
-    pub name: String,
+    /// Programmatic identity for flows constructed via the admin API
+    /// (no filesystem path to derive from). Also serves as the display
+    /// name for path-loaded flows when set (see [`FlowConfig::display_name`]);
+    /// it does not affect identity when the flow has a `source_path`.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Optional label for logging.
     pub labels: Option<Map<String, Value>>,
     /// List of tasks to execute in this flow.
@@ -300,6 +427,9 @@ impl std::fmt::Display for TaskType {
 }
 
 /// Main application configuration.
+///
+/// Flowgen ships as a single binary — there is no separate worker/server
+/// split — so component sections live at the top level.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
     /// Optional cache configuration (shared across components).
@@ -308,15 +438,6 @@ pub struct AppConfig {
     pub flows: FlowOptions,
     /// Optional resource loading configuration (shared across components).
     pub resources: Option<ResourceOptions>,
-    /// Optional worker component configuration.
-    pub worker: Option<WorkerConfig>,
-    /// Optional OpenTelemetry configuration for metrics and tracing.
-    pub telemetry: Option<TelemetryOptions>,
-}
-
-/// Worker component configuration.
-#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
-pub struct WorkerConfig {
     /// Optional HTTP server configuration for webhooks, health checks, and metrics.
     pub http_server: Option<HttpServerOptions>,
     /// Optional MCP server configuration for exposing flows as MCP tools.
@@ -325,11 +446,21 @@ pub struct WorkerConfig {
     /// Runs on its own port so the surface can later migrate to gRPC or WebSocket
     /// independently of the webhook HTTP server.
     pub ai_gateway: Option<AiGatewayOptions>,
+    /// Optional admin web UI configuration for inspecting loaded flows.
+    pub web: Option<WebOptions>,
+    /// Kubernetes-facing liveness/readiness listener. Independent of the
+    /// API listeners so probes keep working regardless of which surfaces
+    /// (http_server / mcp_server / ai_gateway / web) are enabled.
+    /// Defaults to enabled on port 8081 if omitted.
+    #[serde(default)]
+    pub health: HealthOptions,
     /// Optional app-level retry configuration (can be overridden per task).
     pub retry: Option<flowgen_core::retry::RetryConfig>,
     /// Per-edge event channel capacity in events (defaults to 10,000).
     /// When full the upstream task blocks until downstream drains a slot.
     pub event_buffer_size: Option<usize>,
+    /// Optional OpenTelemetry configuration for metrics and tracing.
+    pub telemetry: Option<TelemetryOptions>,
 }
 
 /// Cache type for storage backend.
@@ -348,8 +479,9 @@ pub struct CacheOptions {
     /// Cache backend type.
     #[serde(rename = "type")]
     pub cache_type: CacheType,
-    /// Path to cache credentials file.
-    pub credentials_path: PathBuf,
+    /// Optional path to cache credentials file.
+    #[serde(default)]
+    pub credentials_path: Option<PathBuf>,
     /// NATS server URL (e.g., "nats://localhost:4222"). Defaults to "localhost:4222".
     #[serde(default = "default_nats_url")]
     pub url: String,
@@ -550,6 +682,61 @@ pub struct AiGatewayOptions {
     pub max_body_bytes: usize,
 }
 
+/// Default admin web UI port.
+fn default_web_port() -> u16 {
+    8080
+}
+
+/// Default admin web UI path prefix.
+fn default_web_path() -> String {
+    "/".to_string()
+}
+
+/// Admin web UI configuration options.
+///
+/// Serves a lightweight, read-only dashboard for inspecting loaded flows.
+/// The UI is built into the binary as static assets.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+pub struct WebOptions {
+    /// Whether the admin web UI is enabled.
+    pub enabled: bool,
+    /// Port for the admin web server. Defaults to 8080.
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+    /// Path prefix for the admin web UI. Defaults to "/".
+    #[serde(default = "default_web_path")]
+    pub path: String,
+}
+
+/// Default health listener port.
+fn default_health_port() -> u16 {
+    8081
+}
+
+/// Default `enabled: true` for HealthOptions when the field is omitted.
+fn default_health_enabled() -> bool {
+    true
+}
+
+/// Kubernetes liveness/readiness listener configuration.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HealthOptions {
+    /// Whether the health listener is enabled. Defaults to true.
+    pub enabled: bool,
+    /// Health listener port. Defaults to 8081.
+    pub port: u16,
+}
+
+impl Default for HealthOptions {
+    fn default() -> Self {
+        Self {
+            enabled: default_health_enabled(),
+            port: default_health_port(),
+        }
+    }
+}
+
 /// Default webhook HTTP server port.
 fn default_http_port() -> u16 {
     3000
@@ -579,14 +766,19 @@ pub struct HttpServerOptions {
     pub auth: Option<flowgen_core::auth::AuthConfig>,
 }
 
-/// OpenTelemetry configuration options for metrics and distributed tracing.
+/// OpenTelemetry configuration for metrics, tracing, and log export.
+///
+/// When `enabled` is false the runtime skips telemetry entirely. When
+/// enabled without a `backend` block the runtime falls back to the
+/// in-memory backend, so `enabled: true` with no other fields is a
+/// valid standalone configuration.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct TelemetryOptions {
     /// Whether OpenTelemetry is enabled.
     pub enabled: bool,
-    /// OTLP endpoint for exporting metrics and traces (defaults to "http://localhost:4317").
-    #[serde(default = "default_otlp_endpoint")]
-    pub otlp_endpoint: String,
+    /// Backend selection. Omitted means in-memory.
+    #[serde(default)]
+    pub backend: Option<TelemetryBackendOptions>,
     /// Service name for resource identification (defaults to "flowgen").
     #[serde(default = "default_service_name")]
     pub service_name: String,
@@ -596,8 +788,32 @@ pub struct TelemetryOptions {
     pub metrics_export_interval: Duration,
 }
 
-fn default_otlp_endpoint() -> String {
-    "http://localhost:4317".to_string()
+/// User-facing backend selection.
+///
+/// Serialized as a tagged enum. Each variant carries only the fields
+/// that make sense for that backend, so an invalid combination
+/// (e.g. `logs_per_flow` on the `remote` backend) fails at parse time.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TelemetryBackendOptions {
+    /// Keep all signals in-process behind bounded per-flow ring buffers.
+    /// Intended for demo and single-node dev; multi-replica deploys
+    /// should use `remote` instead.
+    Memory {
+        /// Log records retained per flow before oldest entries are
+        /// dropped. Defaults to 1000.
+        #[serde(default = "default_logs_per_flow")]
+        logs_per_flow: usize,
+        /// Metric samples retained per flow before oldest entries are
+        /// dropped. Defaults to 1000.
+        #[serde(default = "default_metrics_per_flow")]
+        metrics_per_flow: usize,
+    },
+    /// Push all signals over OTLP/gRPC to a remote collector.
+    Remote {
+        /// gRPC endpoint of the collector (e.g. "http://otel-collector:4317").
+        endpoint: String,
+    },
 }
 
 fn default_service_name() -> String {
@@ -608,6 +824,14 @@ fn default_metrics_interval() -> Duration {
     Duration::from_secs(60)
 }
 
+fn default_logs_per_flow() -> usize {
+    1000
+}
+
+fn default_metrics_per_flow() -> usize {
+    1000
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,29 +840,31 @@ mod tests {
 
     #[test]
     fn test_flow_config_creation() {
-        let flow_config = FlowConfig {
+        let raw = FlowConfigRaw {
             flow: Flow {
-                name: "test_flow".to_string(),
+                name: Some("test_flow".to_string()),
                 labels: None,
                 tasks: vec![],
                 require_leader_election: None,
                 parallel_instances: 1,
             },
         };
+        let flow_config = FlowConfig::from_name(raw, None).expect("valid identity");
 
-        assert_eq!(flow_config.flow.name, "test_flow");
+        assert_eq!(flow_config.flow.name.as_deref(), Some("test_flow"));
         assert!(flow_config.flow.labels.is_none());
         assert!(flow_config.flow.tasks.is_empty());
+        assert_eq!(flow_config.identity(), "test_flow");
     }
 
     #[test]
-    fn test_flow_config_serialization() {
+    fn test_flow_config_raw_serialization_roundtrips() {
         let mut labels = Map::new();
         labels.insert("environment".to_string(), Value::String("test".to_string()));
 
-        let flow_config = FlowConfig {
+        let raw = FlowConfigRaw {
             flow: Flow {
-                name: "serialize_test".to_string(),
+                name: Some("serialize_test".to_string()),
                 labels: Some(labels),
                 tasks: vec![],
                 require_leader_election: None,
@@ -646,9 +872,44 @@ mod tests {
             },
         };
 
-        let serialized = serde_json::to_string(&flow_config).unwrap();
-        let deserialized: FlowConfig = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(flow_config, deserialized);
+        let serialized = serde_json::to_string(&raw).unwrap();
+        let deserialized: FlowConfigRaw = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(raw, deserialized);
+    }
+
+    #[test]
+    fn from_name_requires_flow_name() {
+        let raw = FlowConfigRaw {
+            flow: Flow {
+                name: None,
+                labels: None,
+                tasks: vec![],
+                require_leader_election: None,
+                parallel_instances: 1,
+            },
+        };
+        let err = FlowConfig::from_name(raw, None).unwrap_err();
+        assert!(matches!(
+            err,
+            flowgen_core::validate::Error::MissingFlowIdentity
+        ));
+    }
+
+    #[test]
+    fn from_path_ignores_missing_flow_name() {
+        let raw = FlowConfigRaw {
+            flow: Flow {
+                name: None,
+                labels: None,
+                tasks: vec![],
+                require_leader_election: None,
+                parallel_instances: 1,
+            },
+        };
+        let config = FlowConfig::from_path(raw, "demo/reader".to_string(), None)
+            .expect("path is identity, name not required");
+        assert_eq!(config.identity(), "demo/reader");
+        assert_eq!(config.display_name(), "reader");
     }
 
     #[test]
@@ -657,14 +918,14 @@ mod tests {
         labels.insert("type".to_string(), Value::String("test".to_string()));
 
         let flow = Flow {
-            name: "test_flow".to_string(),
+            name: Some("test_flow".to_string()),
             labels: Some(labels.clone()),
             tasks: vec![],
             require_leader_election: None,
             parallel_instances: 1,
         };
 
-        assert_eq!(flow.name, "test_flow");
+        assert_eq!(flow.name.as_deref(), Some("test_flow"));
         assert_eq!(flow.labels, Some(labels));
         assert!(flow.tasks.is_empty());
     }
@@ -675,14 +936,14 @@ mod tests {
         let task = TaskType::convert(convert_config);
 
         let flow = Flow {
-            name: "flow_with_tasks".to_string(),
+            name: Some("flow_with_tasks".to_string()),
             labels: None,
             tasks: vec![task],
             require_leader_election: None,
             parallel_instances: 1,
         };
 
-        assert_eq!(flow.name, "flow_with_tasks");
+        assert_eq!(flow.name.as_deref(), Some("flow_with_tasks"));
         assert!(flow.labels.is_none());
         assert_eq!(flow.tasks.len(), 1);
         assert!(matches!(flow.tasks[0], TaskType::convert(_)));
@@ -697,7 +958,7 @@ mod tests {
         );
 
         let flow = Flow {
-            name: "serialize_flow".to_string(),
+            name: Some("serialize_flow".to_string()),
             labels: Some(labels),
             tasks: vec![],
             require_leader_election: None,
@@ -712,7 +973,7 @@ mod tests {
     #[test]
     fn test_flow_clone() {
         let flow = Flow {
-            name: "clone_test".to_string(),
+            name: Some("clone_test".to_string()),
             labels: None,
             tasks: vec![],
             require_leader_election: None,
@@ -740,7 +1001,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: true,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/test/cache"),
+                credentials_path: Some(PathBuf::from("/test/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
                 history: None,
@@ -751,28 +1012,23 @@ mod tests {
                 cache: None,
             },
             resources: None,
+            http_server: None,
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
             telemetry: None,
-            worker: Some(WorkerConfig {
-                http_server: None,
-                mcp_server: None,
-                ai_gateway: None,
-                retry: None,
-                event_buffer_size: None,
-            }),
         };
 
         assert!(app_config.cache.is_some());
         assert!(app_config.cache.as_ref().unwrap().enabled);
         assert!(app_config.flows.path.is_some());
         assert!(app_config.telemetry.is_none());
-        assert!(app_config.worker.as_ref().unwrap().http_server.is_none());
-        assert!(app_config.worker.as_ref().unwrap().retry.is_none());
-        assert!(app_config
-            .worker
-            .as_ref()
-            .unwrap()
-            .event_buffer_size
-            .is_none());
+        assert!(app_config.http_server.is_none());
+        assert!(app_config.retry.is_none());
+        assert!(app_config.event_buffer_size.is_none());
         assert!(app_config.resources.is_none());
     }
 
@@ -785,14 +1041,14 @@ mod tests {
                 cache: None,
             },
             resources: None,
+            http_server: None,
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
             telemetry: None,
-            worker: Some(WorkerConfig {
-                http_server: None,
-                mcp_server: None,
-                ai_gateway: None,
-                retry: None,
-                event_buffer_size: None,
-            }),
         };
 
         assert!(app_config.cache.is_none());
@@ -805,7 +1061,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: false,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/serialize/cache"),
+                credentials_path: Some(PathBuf::from("/serialize/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: Some("test_db".to_string()),
                 history: None,
@@ -816,14 +1072,14 @@ mod tests {
                 cache: None,
             },
             resources: None,
+            http_server: None,
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
             telemetry: None,
-            worker: Some(WorkerConfig {
-                http_server: None,
-                mcp_server: None,
-                ai_gateway: None,
-                retry: None,
-                event_buffer_size: None,
-            }),
         };
 
         let serialized = serde_json::to_string(&app_config).unwrap();
@@ -837,7 +1093,7 @@ mod tests {
             cache: Some(CacheOptions {
                 enabled: true,
                 cache_type: CacheType::Nats,
-                credentials_path: PathBuf::from("/clone/cache"),
+                credentials_path: Some(PathBuf::from("/clone/cache")),
                 url: "localhost:4222".to_string(),
                 db_name: None,
                 history: None,
@@ -848,14 +1104,14 @@ mod tests {
                 cache: None,
             },
             resources: None,
+            http_server: None,
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
             telemetry: None,
-            worker: Some(WorkerConfig {
-                http_server: None,
-                mcp_server: None,
-                ai_gateway: None,
-                retry: None,
-                event_buffer_size: None,
-            }),
         };
 
         let cloned = app_config.clone();
@@ -867,7 +1123,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: true,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/test/credentials_path"),
+            credentials_path: Some(PathBuf::from("/test/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
             history: None,
@@ -877,7 +1133,7 @@ mod tests {
         assert!(cache_options.enabled);
         assert_eq!(
             cache_options.credentials_path,
-            PathBuf::from("/test/credentials_path")
+            Some(PathBuf::from("/test/credentials_path"))
         );
     }
 
@@ -886,7 +1142,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: false,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/disabled/cache"),
+            credentials_path: Some(PathBuf::from("/disabled/cache")),
             url: "localhost:4222".to_string(),
             db_name: Some("custom_db".to_string()),
             history: None,
@@ -896,7 +1152,7 @@ mod tests {
         assert!(!cache_options.enabled);
         assert_eq!(
             cache_options.credentials_path,
-            PathBuf::from("/disabled/cache")
+            Some(PathBuf::from("/disabled/cache"))
         );
     }
 
@@ -905,7 +1161,7 @@ mod tests {
         let cache_options = CacheOptions {
             enabled: true,
             cache_type: CacheType::Nats,
-            credentials_path: PathBuf::from("/serialize/credentials_path"),
+            credentials_path: Some(PathBuf::from("/serialize/credentials_path")),
             url: "localhost:4222".to_string(),
             db_name: None,
             history: None,
@@ -955,8 +1211,14 @@ mod tests {
 
     #[test]
     fn test_complex_flow_config() {
-        let convert_config = flowgen_core::task::convert::config::Processor::default();
-        let generate_config = flowgen_core::task::generate::config::Subscriber::default();
+        let convert_config = flowgen_core::task::convert::config::Processor {
+            name: "convert_task".to_string(),
+            ..Default::default()
+        };
+        let generate_config = flowgen_core::task::generate::config::Subscriber {
+            name: "generate_task".to_string(),
+            ..Default::default()
+        };
 
         let mut labels = Map::new();
         labels.insert(
@@ -965,9 +1227,9 @@ mod tests {
         );
         labels.insert("complexity".to_string(), Value::String("high".to_string()));
 
-        let flow_config = FlowConfig {
+        let raw = FlowConfigRaw {
             flow: Flow {
-                name: "complex_flow".to_string(),
+                name: Some("complex_flow".to_string()),
                 labels: Some(labels.clone()),
                 tasks: vec![
                     TaskType::convert(convert_config),
@@ -977,8 +1239,9 @@ mod tests {
                 parallel_instances: 1,
             },
         };
+        let flow_config = FlowConfig::from_name(raw, None).expect("valid identity");
 
-        assert_eq!(flow_config.flow.name, "complex_flow");
+        assert_eq!(flow_config.flow.name.as_deref(), Some("complex_flow"));
         assert_eq!(flow_config.flow.labels, Some(labels));
         assert_eq!(flow_config.flow.tasks.len(), 2);
         assert!(matches!(flow_config.flow.tasks[0], TaskType::convert(_)));
@@ -1022,49 +1285,45 @@ mod tests {
                 cache: None,
             },
             resources: None,
-            telemetry: None,
-            worker: Some(WorkerConfig {
-                http_server: Some(HttpServerOptions {
-                    enabled: true,
-                    port: 8080,
-                    path: "/workers".to_string(),
-                    credentials_path: None,
-                    auth: None,
-                }),
-                mcp_server: None,
-                ai_gateway: None,
-                retry: None,
-                event_buffer_size: None,
+            http_server: Some(HttpServerOptions {
+                enabled: true,
+                port: 8080,
+                path: "/workers".to_string(),
+                credentials_path: None,
+                auth: None,
             }),
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
+            telemetry: None,
         };
 
-        assert!(app_config.worker.as_ref().unwrap().http_server.is_some());
-        let http_server = app_config
-            .worker
-            .as_ref()
-            .unwrap()
-            .http_server
-            .as_ref()
-            .unwrap();
+        assert!(app_config.http_server.is_some());
+        let http_server = app_config.http_server.as_ref().unwrap();
         assert!(http_server.enabled);
         assert_eq!(http_server.port, 8080);
         assert_eq!(http_server.path, "/workers");
     }
 
     #[test]
-    fn test_telemetry_options_creation() {
+    fn test_telemetry_options_remote_backend() {
         let telemetry_options = TelemetryOptions {
             enabled: true,
-            otlp_endpoint: "http://otel-collector:4317".to_string(),
+            backend: Some(TelemetryBackendOptions::Remote {
+                endpoint: "http://otel-collector:4317".to_string(),
+            }),
             service_name: "flowgen".to_string(),
             metrics_export_interval: Duration::from_secs(30),
         };
 
         assert!(telemetry_options.enabled);
-        assert_eq!(
-            telemetry_options.otlp_endpoint,
-            "http://otel-collector:4317"
-        );
+        assert!(matches!(
+            &telemetry_options.backend,
+            Some(TelemetryBackendOptions::Remote { endpoint }) if endpoint == "http://otel-collector:4317"
+        ));
         assert_eq!(telemetry_options.service_name, "flowgen");
         assert_eq!(
             telemetry_options.metrics_export_interval,
@@ -1073,15 +1332,16 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_options_default_values() {
+    fn test_telemetry_options_defaults_to_no_backend() {
         let telemetry_options = TelemetryOptions {
-            enabled: false,
-            otlp_endpoint: "http://localhost:4317".to_string(),
+            enabled: true,
+            backend: None,
             service_name: default_service_name(),
             metrics_export_interval: default_metrics_interval(),
         };
 
-        assert!(!telemetry_options.enabled);
+        assert!(telemetry_options.enabled);
+        assert!(telemetry_options.backend.is_none());
         assert_eq!(telemetry_options.service_name, "flowgen");
         assert_eq!(
             telemetry_options.metrics_export_interval,
@@ -1090,10 +1350,12 @@ mod tests {
     }
 
     #[test]
-    fn test_telemetry_options_serialization() {
+    fn test_telemetry_options_serialization_roundtrip() {
         let telemetry_options = TelemetryOptions {
             enabled: true,
-            otlp_endpoint: "http://grafana:4317".to_string(),
+            backend: Some(TelemetryBackendOptions::Remote {
+                endpoint: "http://grafana:4317".to_string(),
+            }),
             service_name: "flowgen-prod".to_string(),
             metrics_export_interval: Duration::from_secs(120),
         };
@@ -1101,6 +1363,36 @@ mod tests {
         let serialized = serde_json::to_string(&telemetry_options).unwrap();
         let deserialized: TelemetryOptions = serde_json::from_str(&serialized).unwrap();
         assert_eq!(telemetry_options, deserialized);
+    }
+
+    #[test]
+    fn test_telemetry_backend_tagged_enum_yaml() {
+        let yaml_remote = "type: remote\nendpoint: http://otel:4317\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_remote).unwrap();
+        assert!(matches!(
+            &parsed,
+            TelemetryBackendOptions::Remote { endpoint } if endpoint == "http://otel:4317"
+        ));
+
+        let yaml_memory = "type: memory\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_memory).unwrap();
+        assert!(matches!(
+            parsed,
+            TelemetryBackendOptions::Memory {
+                logs_per_flow: 1000,
+                metrics_per_flow: 1000,
+            }
+        ));
+
+        let yaml_memory_custom = "type: memory\nlogs_per_flow: 250\nmetrics_per_flow: 500\n";
+        let parsed: TelemetryBackendOptions = serde_yaml::from_str(yaml_memory_custom).unwrap();
+        assert!(matches!(
+            parsed,
+            TelemetryBackendOptions::Memory {
+                logs_per_flow: 250,
+                metrics_per_flow: 500,
+            }
+        ));
     }
 
     #[test]
@@ -1112,19 +1404,30 @@ mod tests {
                 cache: None,
             },
             resources: None,
+            http_server: None,
+            mcp_server: None,
+            ai_gateway: None,
+            web: None,
+            health: Default::default(),
+            retry: None,
+            event_buffer_size: None,
             telemetry: Some(TelemetryOptions {
                 enabled: true,
-                otlp_endpoint: "http://otel-collector:4317".to_string(),
+                backend: Some(TelemetryBackendOptions::Remote {
+                    endpoint: "http://otel-collector:4317".to_string(),
+                }),
                 service_name: "flowgen".to_string(),
                 metrics_export_interval: Duration::from_secs(60),
             }),
-            worker: None,
         };
 
         assert!(app_config.telemetry.is_some());
         let telemetry = app_config.telemetry.as_ref().unwrap();
         assert!(telemetry.enabled);
-        assert_eq!(telemetry.otlp_endpoint, "http://otel-collector:4317");
+        assert!(matches!(
+            &telemetry.backend,
+            Some(TelemetryBackendOptions::Remote { endpoint }) if endpoint == "http://otel-collector:4317"
+        ));
         assert_eq!(telemetry.service_name, "flowgen");
         assert_eq!(telemetry.metrics_export_interval, Duration::from_secs(60));
     }

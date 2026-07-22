@@ -16,10 +16,26 @@ pub enum Error {
 /// Flow identification and metadata.
 #[derive(Clone, Debug)]
 pub struct FlowOptions {
-    /// Flow name.
+    /// Flow name as declared in YAML — not guaranteed unique across
+    /// folders; use `source_path` for identity.
     pub name: String,
+    /// File path relative to `flows.path` (folder structure preserved,
+    /// extension stripped). Optional — synthetic contexts in tests may
+    /// omit it; callers fall back to `name` when `None`.
+    pub source_path: Option<String>,
     /// Optional labels for flow metadata.
     pub labels: Option<Map<String, Value>>,
+}
+
+impl FlowOptions {
+    /// Returns the flow identity: `source_path` when the loader assigned
+    /// one, otherwise the programmatic `name`.
+    pub fn identity(&self) -> &str {
+        match self.source_path.as_deref() {
+            Some(path) => path,
+            None => &self.name,
+        }
+    }
 }
 
 /// Context information for task execution shared across all tasks.
@@ -82,6 +98,8 @@ impl std::fmt::Debug for TaskContext {
 pub struct TaskContextBuilder {
     /// Unique flow name.
     flow_name: Option<String>,
+    /// Path-shaped flow identity assigned by the loader.
+    source_path: Option<String>,
     /// Optional labels for flow metadata.
     flow_labels: Option<Map<String, Value>>,
     /// Task manager for centralized task lifecycle management.
@@ -108,12 +126,20 @@ impl TaskContextBuilder {
         Self::default()
     }
 
-    /// Sets the unique flow name.
-    ///
-    /// # Arguments
-    /// * `name` - The unique name for this flow.
+    /// Sets the flow identity string (path-shaped when loaded from
+    /// filesystem/cache, programmatic name when API-constructed).
+    /// This is the value returned by [`FlowOptions::identity`] and used
+    /// as the registry key, cache namespace, and tracing `flow=` field.
     pub fn flow_name(mut self, name: String) -> Self {
         self.flow_name = Some(name);
+        self
+    }
+
+    /// Sets the path-shaped flow identity — the filesystem-relative
+    /// path (extension stripped) that uniquely identifies this flow
+    /// regardless of `flow.name` collisions across folders.
+    pub fn source_path(mut self, path: Option<String>) -> Self {
+        self.source_path = path;
         self
     }
 
@@ -218,6 +244,7 @@ impl TaskContextBuilder {
                 name: self
                     .flow_name
                     .ok_or_else(|| Error::MissingBuilderAttribute("flow_name".to_string()))?,
+                source_path: self.source_path,
                 labels: self.flow_labels,
             },
             task_manager: self
