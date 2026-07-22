@@ -10036,13 +10036,14 @@ dependencies = [
 
 [[package]]
 name = "rig-vertexai"
-version = "0.3.7"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dfd8b75740bbac04ee9e9d86d18c0c9e927294b5d232e911a03d37e1fb00f33"
+checksum = "766ed2de2f21e2b4b0adc7e5854516525ff7a0ecf19d1b1a9a6b2a661f2e8d28"
 dependencies = [
+ "base64 0.22.1",
  "google-cloud-aiplatform-v1",
  "google-cloud-auth",
- "rig-core 0.38.2",
+ "rig-core 0.40.0",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

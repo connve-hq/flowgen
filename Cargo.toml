@@ -139,7 +139,7 @@ rustls = { version = "0.23", features = ["ring"] }
 tempfile = { version = "3.8" }
 rig-core = { version = "0.38", features = ["rmcp"] }
 rig = { version = "0.40", features = ["rmcp"] }
-rig-vertexai = { version = "0.3" }
+rig-vertexai = { version = "0.40.0" }
 rmcp = { version = "1", features = [
     "client",
     "transport-streamable-http-client-reqwest",
