@@ -137,9 +137,8 @@ tracing-opentelemetry = { version = "0.28" }
 atty = { version = "0.2" }
 rustls = { version = "0.23", features = ["ring"] }
 tempfile = { version = "3.8" }
-rig-core = { version = "0.38", features = ["rmcp"] }
-rig = { version = "0.40", features = ["rmcp"] }
-rig-vertexai = { version = "0.40.0" }
+rig-core = { version = "0.35", features = ["rmcp"] }
+rig-vertexai = { version = "0.3" }
 rmcp = { version = "1", features = [
     "client",
     "transport-streamable-http-client-reqwest",
