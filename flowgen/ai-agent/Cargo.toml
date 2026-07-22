@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
+rig = { workspace = true }
 rig-core = { workspace = true }
 rig-vertexai = { workspace = true }
 rmcp = { workspace = true }

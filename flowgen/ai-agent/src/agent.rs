@@ -14,6 +14,7 @@ use futures_util::stream::Stream;
 use futures_util::StreamExt;
 use rig::agent::{Agent, MultiTurnStreamItem};
 use rig::client::CompletionClient as RigCompletionClientTrait;
+use rig::client::CompletionClient;
 use rig::completion::message::{Reasoning, ReasoningContent};
 use rig::completion::{
     CompletionError, CompletionModel, CompletionRequest, Document, Prompt, Usage,
@@ -344,7 +345,7 @@ impl ClientBuilder {
                 }
                 let client = builder
                     .build()
-                    .map_err(|reason| Error::VertexAiClient { reason })?;
+                    .map_err(|reason| Error::VertexAiClient { reason: reason.to_string() })?;
                 Ok(AgentClient {
                     provider: self.provider,
                     model: self.model,
