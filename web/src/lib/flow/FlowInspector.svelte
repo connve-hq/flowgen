@@ -6,6 +6,7 @@
 	import Badge from '$lib/Badge.svelte';
 	import CopyButton from '$lib/CopyButton.svelte';
 	import ActivityPanel from '$lib/flow/ActivityPanel.svelte';
+	import StateMessage from '$lib/StateMessage.svelte';
 	import { apiUrl } from '$lib/api';
 
 	interface Activity {
@@ -225,7 +226,7 @@
 							class="btn btn-ghost btn-sm btn-circle"
 							aria-label="Open full page"
 						>
-							<Icon icon="tabler:external-link" class="h-6 w-6" />
+							<Icon icon="tabler:external-link" class="h-5 w-5" />
 						</a>
 					</div>
 					<div class="tooltip tooltip-left" data-tip="Close">
@@ -235,7 +236,7 @@
 							aria-label="Close"
 							onclick={closeResource}
 						>
-							<Icon icon="tabler:x" class="h-6 w-6" />
+							<Icon icon="tabler:x" class="h-5 w-5" />
 						</button>
 					</div>
 				</div>
@@ -249,8 +250,8 @@
 						<span class="loading loading-spinner loading-md text-primary"></span>
 					</div>
 				{:else if previewError}
-					<div class="alert alert-error m-4" role="alert">
-						<span>{previewError}</span>
+					<div class="flex-1">
+						<StateMessage tone="oops" title="Failed to load resource" message={previewError} />
 					</div>
 				{:else if previewContent}
 					<div class="min-h-0 flex-1 overflow-auto">

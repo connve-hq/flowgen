@@ -1,5 +1,143 @@
 # Changelog
 
+## 0.130.0
+
+### Features
+
+- **Agents chat in the admin UI.** A new "Agents" tab (the first nav
+  item) hosts a built-in chat that talks to the AI gateway through the
+  admin server, so the browser stays same-origin and the gateway needs
+  no CORS. Messages stream token-by-token over SSE; assistant replies
+  render Markdown, code (Prism-highlighted), and inline HTML using the
+  same palette as the resource viewer. The model selector is populated
+  from the gateway's `/models` list. Each message has a copy button and
+  a hover timestamp. An "agent" is just a flow with an `llm_proxy`
+  endpoint — there is no separate agent registry.
+
+- **Conversation history for the Agents chat.** Conversations are
+  persisted through the admin API (`GET/PUT/DELETE
+  /api/agents/conversations[/{id}]`) into the configured **system**
+  cache, which is out of user-script reach — one tenant's flow script
+  cannot read another's chats. Each conversation lives under a
+  `/agents/{id}` URL so it deep-links and survives a reload. History is
+  written as soon as a message is sent (not only after the reply) and
+  the TTL is refreshed on every write. Retention defaults to 30 days,
+  configurable via `web.agents.conversation_history_ttl`; long-term
+  history belongs in a database via a persistence flow. When no system
+  cache bucket is configured (single-binary / in-memory), history falls
+  back to the runtime cache with a warning, since that mode has no
+  tenant isolation to protect.
+
+- **`llm_proxy` advertises its models.** The `llm_proxy` config gains a
+  `models` list that the gateway returns from `/models` as full
+  `<proxy>/<model>` ids, so clients (including the built-in chat) can
+  populate a model selector without knowing the routing prefix. Routing
+  itself still lives in the proxy's script — declaring a model does not
+  decide where it goes. `models` is a discovery menu, not a whitelist:
+  an unlisted model is still forwarded for the script/provider to handle.
+
+- **Proxies can hide the model and auto-route.** A proxy that declares no
+  `models` is advertised by its bare name and accepts a bare id (no
+  `<model>`): the client picks nothing and the routing script chooses the
+  downstream model. A proxy that *does* list models requires the client
+  to pick one — a bare id to it is rejected. Auto-routed requests carry
+  no `requested_model` in `event.meta` (absent, not a sentinel), so they
+  are filtered by that field's absence.
+
+- **Agents chat shows the tools an agent ran.** When a server-side agent
+  (`ai_completion` with `tool_passthrough: false`) invokes a tool mid-turn,
+  the gateway now streams it as a standard OpenAI `delta.tool_calls` frame
+  (informational — no `tool_calls` finish reason, so tool-loop clients
+  ignore it). The built-in chat renders these as a collapsible "tool calls"
+  section in the reply, separated from the text, each row expandable to its
+  arguments. This also fixes reply text that used to run together across a
+  tool call (the pre-tool and post-tool text segments are now distinct).
+
+### Fixes
+
+- **Tool-using agents no longer fail every tool call.** `ai_completion`'s
+  `max_turns` is now a required setting with a non-zero default (10) instead
+  of an `Option` that left rig's turn budget at 0. With a 0 budget the agent
+  could make one model call but had no turn to act on a tool result, so any
+  tool invocation died with `MaxTurnError` and tore down the in-flight MCP
+  connection as "Transport closed" — the marketing-assistant demo agent
+  could never actually run its BigQuery tool.
+
+- **Agents chat: stop button and a live status line.** A generation can be
+  stopped mid-stream with the composer's Stop button or Esc (aborts the
+  streaming request, keeps what arrived). While a turn is in progress the
+  reply shows a shimmering brand-gradient status line (`✱ Working…` /
+  `✱ <tool>…`) instead of a text cursor; tool calls render as expandable
+  status rows (arguments shown only when expanded).
+
+- **Agents chat model selector no longer collapses a proxy's models into
+  identical rows.** `display_name`/`description` are proxy-level labels the
+  gateway copies onto every model entry, so a proxy exposing two models
+  rendered two indistinguishable rows and the model names were lost. The
+  selector now groups models by proxy — the name and description (wrapped
+  to two lines) show once, with the proxy's models listed beneath as
+  pickable rows — and falls back to the bare proxy name when no
+  `display_name` label is set. It also hides proxies whose `protocol` the
+  built-in chat can't drive (it speaks OpenAI; Anthropic proxies are
+  skipped), and `/models` entries now carry a `protocol` field.
+
+- **`clients` visibility filter is exclusive.** A proxy's `clients` list
+  now scopes it: a named client (the built-in chat sends
+  `X-Flowgen-Client: flowgen-ui`) sees only proxies that list it, and an
+  anonymous request sees only proxies with an empty `clients`. Previously
+  an empty `clients` meant "visible to everyone", so every public proxy
+  leaked into the built-in chat. A proxy must now list `flowgen-ui` in
+  `clients` to appear in the chat.
+
+- **Log viewer sorts newest-first and trims correctly.** Records arrive
+  out of order — the snapshot flattens per-flow ring buffers in hash-map
+  order and the live tail interleaves retries from many flows — so rows
+  displayed in arrival order jumped around by timestamp and new records
+  could land buried mid-list. The `/logs` viewer now sorts the buffer by
+  timestamp (newest at the top, live tail pinned there), and the line
+  limit evicts the genuinely oldest records instead of dropping by insert
+  order.
+
+- **Gateway no longer duplicated streamed replies.** When a downstream
+  provider streamed token deltas, the final completion event re-emitted
+  the whole text, so responses appeared twice. The gateway now suppresses
+  the final full-text emission once progress deltas have streamed.
+
+- **Consistent icon buttons, tooltips, and brand green across the admin
+  UI.** Toolbar actions (Live/Pause, Clear, Resume) are now icon-only
+  buttons with styled tooltips instead of icon+text, every icon-only
+  control has a daisyUI tooltip and `aria-label` (replacing bare
+  `title=` attributes), icon sizes are unified, and the dark-mode
+  primary green is tuned to match the brand.
+
+- **Empty and error states share one friendly design.** Every full-panel
+  empty or failed-to-load state (no flows, no resources, no models, a
+  service that didn't respond) now renders as a centered message with a
+  soft brand glow instead of a raw red or amber alert. The Agents chat no
+  longer flashes the greeting before switching to "no models".
+
+- **Flow graph no longer overlaps edges on fan-in.** The DAG lays out
+  from each node's real rendered size, so branches that merge back into
+  one task (for example a diff flow's put/delete branches) route cleanly
+  instead of collapsing onto a single line.
+
+- **Long folder names truncate in the flows sidebar.** A deeply nested or
+  verbose folder name is clipped with an ellipsis and its full name shown
+  on hover, instead of overflowing the sidebar.
+
+- **Esc clears the Agents chat composer.** Pressing Esc with a drafted
+  message clears it; while a reply is streaming, Esc still stops
+  generation.
+
+- **Flow status label reads `Ok`.** The `ok` status pill and filter now
+  read `Ok`, matching the sentence case of `Warn`, `Error`, and `Info`.
+
+### Internal
+
+- Conversation request/response types are defined in `openapi.yaml` and
+  generated for both the Rust handlers (`flowgen_client::types`) and the
+  web client (`generated.ts`), keeping the two in lockstep.
+
 ## 0.129.0
 
 ### Breaking
