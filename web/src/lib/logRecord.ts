@@ -11,7 +11,7 @@
 
 import type { LogRecord, LogSpan } from '$lib/api';
 
-export type ActivityLevel = 'info' | 'warning' | 'error';
+export type ActivityLevel = 'info' | 'warning' | 'error' | 'debug' | 'trace';
 
 export interface SpanSummary {
 	flow: string | null;
@@ -29,6 +29,15 @@ export interface FieldSummary {
 // Span fields hoisted into overview (`SpanSummary`) so they are not
 // re-shown in the raw spans list.
 const HOISTED_SPAN_FIELDS = new Set(['flow', 'task', 'task_type', 'task_id', 'duration_ms']);
+
+// Event-level field keys with special handling in `extractFieldSummary`,
+// matching the names `flowgen_core::event` writes server-side.
+const FIELD_EVENT_ID = 'event.id';
+const FIELD_EVENT_ID_LEGACY = 'event_id';
+const FIELD_EVENT_SUBJECT = 'event.subject';
+// Joined `send_with_logging().context(k, v)` calls — see the comment in
+// `extractFieldSummary` for why this needs unpacking.
+const FIELD_CONTEXT = 'context';
 
 // Extracts identity fields from the span chain, leaf-to-root (so an
 // inner span shadowing an outer span wins).
@@ -61,11 +70,29 @@ export function extractFieldSummary(record: LogRecord): FieldSummary {
 	let event_id: string | null = null;
 	const extra: Array<[string, string]> = [];
 	for (const f of record.fields) {
-		if (f.key === 'event.id' || f.key === 'event_id') {
+		if (f.key === FIELD_EVENT_ID || f.key === FIELD_EVENT_ID_LEGACY) {
 			event_id = f.value;
 			continue;
 		}
-		if (f.key === 'event.subject') continue;
+		if (f.key === FIELD_EVENT_SUBJECT) continue;
+		// `context` carries `send_with_logging().context(k, v)` calls, joined
+		// server-side into one JSON object because `tracing` fields must be
+		// static per callsite. Split it back into individual attributes here
+		// so e.g. token counts and latency show as their own rows, not one
+		// blob string.
+		if (f.key === FIELD_CONTEXT) {
+			try {
+				const parsed: unknown = JSON.parse(f.value);
+				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+					for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+						extra.push([k, typeof v === 'string' ? v : JSON.stringify(v)]);
+					}
+					continue;
+				}
+			} catch {
+				// Not JSON — fall through and show it as a plain attribute.
+			}
+		}
 		extra.push([f.key, f.value]);
 	}
 	return { event_id, extra };
@@ -101,16 +128,83 @@ export function timestampMs(record: LogRecord): number | null {
 	return Number.isFinite(parsed) ? parsed : null;
 }
 
-// Maps the tracing level string to the three-value activity level used
-// by the counters and status pills. Debug/trace levels are folded into
-// `info` because the activity panel only shows info/warning/error.
+// Maps the tracing level string to the five-value activity level used by
+// the counters and status pills. `warn` renames to `warning` for the
+// activity/status vocabulary; the rest pass through unchanged.
 export function activityLevel(record: LogRecord): ActivityLevel {
 	switch (record.level) {
 		case 'error':
 			return 'error';
 		case 'warn':
 			return 'warning';
+		case 'debug':
+			return 'debug';
+		case 'trace':
+			return 'trace';
 		default:
 			return 'info';
+	}
+}
+
+// Chip CSS classes for a level toggle button, shared by `/logs` and the
+// per-flow Activity panel so neither drifts on colors. `inactive` covers
+// both "toggled off" and hover states the caller doesn't otherwise style.
+export function levelChipClass(level: ActivityLevel, active: boolean): string {
+	if (!active) return 'chip-inactive';
+	switch (level) {
+		case 'error':
+			return 'chip-error';
+		case 'warning':
+			return 'chip-warn';
+		case 'info':
+			return 'chip-info';
+		default:
+			return 'chip-neutral';
+	}
+}
+
+// Text color for a level's icon/badge in the detail drawer and row markers.
+export function levelBadgeColor(level: ActivityLevel): string {
+	switch (level) {
+		case 'error':
+			return 'text-error';
+		case 'warning':
+			return 'text-warning';
+		case 'debug':
+		case 'trace':
+			return 'text-base-content/50';
+		default:
+			return 'text-primary';
+	}
+}
+
+// Background color for a level's status dot, shared by `/logs` rows and
+// the Activity panel's row markers and detail drawer.
+export function levelDotClass(level: ActivityLevel): string {
+	switch (level) {
+		case 'error':
+			return 'bg-error';
+		case 'warning':
+			return 'bg-warning';
+		case 'info':
+			return 'bg-primary';
+		default:
+			return 'bg-base-300';
+	}
+}
+
+// Display label for a level, capitalized for chip/header text.
+export function levelLabel(level: ActivityLevel): string {
+	switch (level) {
+		case 'warning':
+			return 'Warn';
+		case 'error':
+			return 'Error';
+		case 'debug':
+			return 'Debug';
+		case 'trace':
+			return 'Trace';
+		default:
+			return 'Info';
 	}
 }

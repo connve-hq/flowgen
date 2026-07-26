@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.131.0
+
+### Fixes
+
+- **Per-flow Activity panel showed "No events yet" even with real activity.**
+  The panel's event list now comes from the same `/api/logs` history +
+  `/api/logs/stream` live tail the global `/logs` viewer uses (scoped to the
+  flow), instead of a metrics-only SSE stream with no history replay. A flow
+  that already finished its startup burst now shows its history immediately
+  on open instead of staying empty until the next live event.
+- **Per-flow SSE connections could pile up and starve other requests.** Only
+  one per-flow event subscription is kept open at a time; switching flows,
+  closing the modal, or navigating away now closes the previous connection
+  instead of leaving it open for the rest of the session (browsers cap
+  concurrent connections per origin on HTTP/1.1).
+- **Flow graph nodes could overlap on a flow's second open.** The DAG
+  layout's re-layout guard didn't reset when node measurement restarted on
+  a subsequent open, so nodes could be left at their pre-layout stacked
+  positions instead of dagre's computed layout.
+- **DAG node status badge could overflow into neighboring nodes.** The
+  duration badge had no maximum width, so a wide duration string could push
+  past the node's reserved space. The node, its status column, and the
+  badge are now all fixed-width end to end.
+- Raising the `/logs` line limit while lowering the level filter to remove
+  a stale UI state where the trim used the previous limit instead of the
+  newly applied one.
+- **Agents chat model picker stayed open after selecting a model.** Clicking
+  a model kept focus inside the dropdown, so the CSS-only `:focus-within`
+  panel never saw focus leave and closed itself.
+- **Log attributes like token counts and latency showed as one joined JSON
+  string instead of separate rows.** `tracing` requires field names to be
+  static per callsite, so multiple `.context(key, value)` calls on one log
+  line are joined server-side into a single `context` field; the admin UI
+  now unpacks it back into individual attributes, so e.g. `prompt_tokens`,
+  `completion_tokens`, and `latency_ms` each show as their own row again.
+
+### Improvements
+
+- **`llm_proxy` and `mcp_tool` can scope which callers can see and use
+  them.** Both gained a `headers` field: a map of HTTP headers a request
+  must carry, with matching values, to be listed or invoked at all — an
+  agent meant to use only a specific database tool can now be kept from
+  seeing or calling unrelated tools. This replaces
+  `llm_proxy`'s old `clients` list, which only hid a proxy from a client's
+  model list but never blocked the request itself; `headers` blocks both.
+  `ai_completion` (`headers`) and its `mcp_servers` entries (`headers`) can
+  now send arbitrary headers to identify themselves to a scoped downstream
+  proxy or MCP server. The admin server's own outbound requests (the
+  built-in Agents chat) now source their identifying header from
+  `web.headers` in config instead of a hardcoded value.
+
+- **Per-flow Activity panel gains a history limit control and Debug/Trace
+  chips**, matching the global `/logs` viewer. The limit is independent per
+  view (raising it in the panel doesn't affect `/logs`); Debug/Trace default
+  off everywhere, Info/Warning/Error default on in the panel (you're
+  inspecting one flow's behavior) versus Warning/Error only on `/logs`
+  (system-wide error scanning). Level colors and labels are now a single
+  shared implementation so the two views can't drift.
+- **Observability backend split into two traits**, mirroring the existing
+  cache trait pattern: `LogsStore` (event/log history and live tail) and
+  `MetricsStore` (per-flow counters and status, plus OTLP emission). The ad
+  hoc `FlowRegistry` type is gone; both traits have one in-memory
+  implementation today and are structured so a vendor-backed implementation
+  can be added later without touching the admin API or UI.
+
 ## 0.130.0
 
 ### Features
