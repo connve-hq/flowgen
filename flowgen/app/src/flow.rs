@@ -184,6 +184,12 @@ pub enum Error {
     /// Error in Braze export user IDs task.
     #[error(transparent)]
     BrazeExportUsersIds(#[from] flowgen_braze::export::users::processor::Error),
+    /// Error in MongoDB collection task.
+    #[error(transparent)]
+    MongoDbCollection(#[from] flowgen_mongodb::collection::Error),
+    /// Error in MongoDB change stream task.
+    #[error(transparent)]
+    MongoDbChangeStream(#[from] flowgen_mongodb::change_stream::Error),
     /// Failed to store background task handles for later monitoring.
     #[error("Error storing background task handles")]
     BackgroundHandlesStoreFailed,
@@ -1939,6 +1945,48 @@ async fn spawn_task(
                 .instrument(span),
             )
         }
+
+        TaskType::mongodb_collection(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder = flowgen_mongodb::collection::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context);
+                    if let Some(rx) = rx {
+                        builder = builder.receiver(rx);
+                    }
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build()?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
+
+        TaskType::mongodb_change_stream(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder =
+                        flowgen_mongodb::change_stream::ChangeStreamReaderBuilder::new()
+                            .config(config)
+                            .task_id(task_id)
+                            .task_type(task_type_str)
+                            .task_context(task_context);
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
     };
 
     Ok(handle)
@@ -2731,6 +2779,7 @@ mod tests {
                 arguments: Vec::new(),
                 template: Some(flowgen_core::resource::Source::Inline("body".to_string())),
                 messages: None,
+                headers: std::collections::HashMap::new(),
                 depends_on: None,
                 retry: None,
             })
@@ -2790,6 +2839,7 @@ mod tests {
                 arguments: Vec::new(),
                 template: Some(flowgen_core::resource::Source::Inline("body".to_string())),
                 messages: None,
+                headers: std::collections::HashMap::new(),
                 depends_on: None,
                 retry: None,
             })

@@ -32,14 +32,14 @@ filesystem source wins.
   rollout in Kubernetes. This is the simplest model and the right
   choice when flows live next to the binary or are mounted from a
   ConfigMap. See [Flow discovery](https://connve.com/docs/flowgen/concepts/flows#flow-discovery).
-- **Git sync.** A bootstrap flow (`system_sync_workspace`) pulls
+- **Git sync.** A bootstrap flow (`sync_workspace`) pulls
   flow YAMLs and resource files from a Git repository at a fixed
   interval and writes them to the system cache. Hot-reload picks up
   changes without restarting the worker — push to the branch and
   watcher restarts only the affected flows. Works with any HTTPS Git
   host (GitHub, GitLab, Bitbucket, Gitea, self-hosted). See
   [Git Sync](https://connve.com/docs/flowgen/git/sync) and the
-  [`examples/git/system_sync_workspace.yaml`](https://github.com/connve/flowgen/blob/main/examples/git/system_sync_workspace.yaml)
+  [`examples/git/sync_workspace.yaml`](https://github.com/connve/flowgen/blob/main/examples/git/sync_workspace.yaml)
   bootstrap.
 - **OCI artifact sync.** Same hot-reload shape as Git, but the
   workspace is packaged as an OCI artifact and pulled from an OCI
@@ -52,7 +52,7 @@ filesystem source wins.
   Docker `config.json` payload, so the same `imagePullSecrets`
   Secret authenticates artifact pulls. See
   [OCI Sync](https://connve.com/docs/flowgen/oci/sync) and the
-  [`examples/oci/system_sync_workspace.yaml`](https://github.com/connve/flowgen/blob/main/examples/oci/system_sync_workspace.yaml)
+  [`examples/oci/sync_workspace.yaml`](https://github.com/connve/flowgen/blob/main/examples/oci/sync_workspace.yaml)
   bootstrap.
 
 Hot-reload requires a system cache that supports key watches (the
@@ -77,8 +77,8 @@ Download the latest release for your platform from [GitHub Releases](https://git
 | macOS | `Apple Silicon` | `flowgen-darwin-arm64-VERSION.tar.gz` |
 
 ```bash
-# Example: Linux x86_64, replace version as needed
-VERSION=0.122.0
+# Example: Linux x86_64, adjust the archive name for your platform
+VERSION=$(curl -s https://api.github.com/repos/connve/flowgen/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
 curl -LO "https://github.com/connve/flowgen/releases/download/v${VERSION}/flowgen-linux-amd64-${VERSION}.tar.gz"
 tar -xzf "flowgen-linux-amd64-${VERSION}.tar.gz"
 sudo mv flowgen /usr/local/bin/
