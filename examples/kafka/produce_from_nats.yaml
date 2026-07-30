@@ -1,0 +1,49 @@
+# Consume events from a NATS JetStream stream and produce them to a Kafka topic.
+#
+# Each incoming NATS message is serialised to bytes (JSON, Avro, Arrow, or
+# raw bytes depending on the event data type) and published to the configured
+# Kafka topic. The downstream event carries the produce result (topic,
+# partition, offset).
+#
+# Required:
+#   - NATS credentials at /etc/nats/credentials.json
+#   - NATS_URL env var
+#   - Kafka brokers accessible at localhost:9092 (or set brokers:)
+#
+# Optional (Kafka auth):
+#   - /etc/kafka/credentials.json  (see below for format)
+#
+# Kafka credentials file format (/etc/kafka/credentials.json):
+#   SASL:
+#     { "sasl": { "username": "...", "password": "...", "mechanism": "SCRAM-SHA-256" } }
+#   SSL:
+#     { "ssl": { "ca_location": "/etc/kafka/ca.pem", "certificate_location": "/etc/kafka/cert.pem", "key_location": "/etc/kafka/key.pem" } }
+flow:
+  labels:
+    display_name: "Kafka Produce from NATS"
+    description: "Subscribes to a NATS JetStream stream and produces each event as a message to a Kafka topic."
+    tags: ["kafka", "nats", "producer", "example"]
+  tasks:
+
+    - nats_jetstream_subscriber:
+        name: consume_events
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        subject: pubsub.data.kafka
+        stream:
+          create_or_update: true
+          name: kafka_events
+          description: "Events to be produced to Kafka."
+          subjects: ["pubsub.data.kafka"]
+          max_age: 24h
+          retention: limits
+          discard: old
+        durable_name: kafka_producer
+        ack_timeout: "60s"
+
+    - kafka_produce:
+        name: produce_to_kafka
+        credentials_path: /etc/kafka/credentials.json
+        brokers: "localhost:9092"
+        topic: my-topic
+        message_key: "key-{{event.id}}"
