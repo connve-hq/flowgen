@@ -25,3 +25,4 @@ flow:
         name: produce_sample
         brokers: "localhost:9092"
         topic: sample-events
+        create_or_update: true

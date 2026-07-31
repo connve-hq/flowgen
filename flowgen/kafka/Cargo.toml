@@ -24,6 +24,7 @@ tokio-retry = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
 humantime-serde = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

@@ -2,7 +2,9 @@ use flowgen_core::client::Client;
 use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventBuilder, EventData, EventExt};
 use futures_util::future;
-use rdkafka::producer::FutureRecord;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
+use rdkafka::producer::{FutureRecord, Producer as RdkafkaProducer};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -41,6 +43,19 @@ pub enum Error {
     #[error("Delivery error: {status:?}")]
     Delivery {
         status: rdkafka::types::RDKafkaRespErr,
+    },
+    #[error("Topic '{topic}' does not exist on the Kafka cluster")]
+    TopicNotFound { topic: String },
+    #[error("Topic creation error for '{topic}': {source}")]
+    TopicCreation {
+        topic: String,
+        #[source]
+        source: rdkafka::error::KafkaError,
+    },
+    #[error("Metadata fetch error: {source}")]
+    MetadataFetch {
+        #[source]
+        source: rdkafka::error::KafkaError,
     },
     #[error("JSON serialization error: {source}")]
     SerdeJson {
@@ -95,6 +110,73 @@ fn serialize_event_to_bytes(event: &Event) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// Patches a UUID v7 id into the "event.id" field of the render context
+/// when the incoming event has no id, so templates like "{{event.id}}" in
+/// `message_key` always resolve to a value.
+fn ensure_event_id(event_value: &mut serde_json::Value) {
+    let id_is_null = event_value
+        .get("event")
+        .and_then(|e| e.get("id"))
+        .is_none_or(|id| id.is_null());
+    if id_is_null {
+        if let Some(event_obj) = event_value.get_mut("event").and_then(|e| e.as_object_mut()) {
+            event_obj.insert(
+                "id".to_string(),
+                serde_json::json!(uuid::Uuid::now_v7().to_string()),
+            );
+        }
+    }
+}
+
+/// Ensures the configured topic exists.
+///
+/// When `create_or_update` is `true` the topic is created with default
+/// settings (1 partition, replication factor 1) if it does not already
+/// exist.  When `false` an error is returned if the topic is absent from
+/// the cluster.
+async fn setup_topic(
+    producer: &rdkafka::producer::FutureProducer,
+    credentials_path: &Option<std::path::PathBuf>,
+    brokers: &str,
+    topic: &str,
+    create_or_update: bool,
+) -> Result<(), Error> {
+    let metadata = producer
+        .client()
+        .fetch_metadata(Some(topic), std::time::Duration::from_secs(10))
+        .map_err(|e| Error::MetadataFetch { source: e })?;
+
+    let exists = metadata.topics().iter().any(|t| t.name() == topic && t.error().is_none());
+
+    if exists {
+        return Ok(());
+    }
+
+    if create_or_update {
+        let config = crate::client::build_base_config(credentials_path, brokers)
+            .map_err(|e| Error::ClientAuth { source: e })?;
+        let admin_client: AdminClient<DefaultClientContext> = config
+            .create()
+            .map_err(|e| Error::ClientAuth {
+                source: crate::client::Error::CreateAdminClient { source: e },
+            })?;
+
+        let new_topic = NewTopic::new(topic, 1, TopicReplication::Fixed(1));
+        admin_client
+            .create_topics(&[new_topic], &AdminOptions::new())
+            .await
+            .map_err(|e| Error::TopicCreation {
+                topic: topic.to_string(),
+                source: e,
+            })?;
+        Ok(())
+    } else {
+        Err(Error::TopicNotFound {
+            topic: topic.to_string(),
+        })
+    }
+}
+
 pub struct EventHandler {
     producer: Arc<rdkafka::producer::FutureProducer>,
     task_id: usize,
@@ -110,8 +192,15 @@ impl EventHandler {
         let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
 
         flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
-            let event_value = serde_json::value::Value::try_from(event.as_ref())
+            let mut event_value = serde_json::value::Value::try_from(event.as_ref())
                 .map_err(|source| Error::EventBuilder { source })?;
+
+            // Incoming events do not always carry an id (e.g. NATS messages
+            // without a Nats-Msg-Id header, generate tasks). Patch a UUID v7
+            // fallback into the render context so templates like
+            // "{{event.id}}" always resolve to a value.
+            ensure_event_id(&mut event_value);
+
             let config = self
                 .config
                 .render(&event_value)
@@ -227,6 +316,15 @@ impl flowgen_core::task::runner::Runner for Producer {
                     Error::ClientRegistryMismatch
                 }
             })?;
+
+        setup_topic(
+            &producer,
+            &init_config.credentials_path,
+            &init_config.brokers,
+            &init_config.topic,
+            init_config.create_or_update,
+        )
+        .await?;
 
         let event_handler = EventHandler {
             producer: Arc::clone(&producer),
@@ -394,7 +492,10 @@ impl ProducerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
     use serde_json::{Map, Value};
+    use std::sync::Arc as StdArc;
     use tokio::sync::mpsc;
 
     fn create_mock_task_context() -> Arc<flowgen_core::task::context::TaskContext> {
@@ -421,8 +522,133 @@ mod tests {
         )
     }
 
+    // ------------------------------------------------------------------
+    // Error display
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_error_display() {
+        assert_eq!(
+            Error::TopicNotFound { topic: "x".into() }.to_string(),
+            "Topic 'x' does not exist on the Kafka cluster"
+        );
+        assert_eq!(
+            Error::MissingClient.to_string(),
+            "Client is missing or not initialized"
+        );
+        assert_eq!(
+            Error::MissingBuilderAttribute("foo".into()).to_string(),
+            "Missing required builder attribute: foo"
+        );
+        assert_eq!(
+            Error::ClientRegistryMismatch.to_string(),
+            "Client registry type mismatch -- same credentials used with incompatible client types"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ProduceResult round-trip
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_produce_result_round_trip() {
+        let r = ProduceResult { topic: "t".into(), partition: 2, offset: 99 };
+        let json = serde_json::to_value(&r).unwrap();
+        let back: ProduceResult = serde_json::from_value(json).unwrap();
+        assert_eq!(back.topic, "t");
+        assert_eq!(back.partition, 2);
+        assert_eq!(back.offset, 99);
+    }
+
+    // ------------------------------------------------------------------
+    // serialize_event_to_bytes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_serialize_json() {
+        let event = Event {
+            data: EventData::Json(serde_json::json!({"hello": "world"})),
+            subject: "s".into(),
+            id: None,
+            timestamp: 0,
+            task_id: 0,
+            task_type: "",
+            meta: None,
+            error: None,
+            completion_tx: None,
+        };
+        let bytes = serialize_event_to_bytes(&event).unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed, serde_json::json!({"hello": "world"}));
+    }
+
+    #[test]
+    fn test_serialize_bytes() {
+        let event = Event {
+            data: EventData::Bytes(bytes::Bytes::from(&b"raw data"[..])),
+            subject: "s".into(),
+            id: None,
+            timestamp: 0,
+            task_id: 0,
+            task_type: "",
+            meta: None,
+            error: None,
+            completion_tx: None,
+        };
+        let bytes = serialize_event_to_bytes(&event).unwrap();
+        assert_eq!(bytes, b"raw data");
+    }
+
+    #[test]
+    fn test_serialize_arrow() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            StdArc::new(schema),
+            vec![StdArc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let event = Event {
+            data: EventData::ArrowRecordBatch(batch),
+            subject: "s".into(),
+            id: None,
+            timestamp: 0,
+            task_id: 0,
+            task_type: "",
+            meta: None,
+            error: None,
+            completion_tx: None,
+        };
+        let bytes = serialize_event_to_bytes(&event).unwrap();
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn test_serialize_avro() {
+        let data = EventData::Avro(flowgen_core::event::AvroData {
+            schema: r#"{"type":"record","name":"r","fields":[{"name":"x","type":"int"}]}"#.into(),
+            raw_bytes: vec![0x01],
+        });
+        let event = Event {
+            data,
+            subject: "s".into(),
+            id: None,
+            timestamp: 0,
+            task_id: 0,
+            task_type: "",
+            meta: None,
+            error: None,
+            completion_tx: None,
+        };
+        let bytes = serialize_event_to_bytes(&event).unwrap();
+        assert_eq!(bytes, vec![0x01]);
+    }
+
+    // ------------------------------------------------------------------
+    // ProducerBuilder
+    // ------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_producer_builder() {
+    async fn test_producer_builder_success() {
         let config = Arc::new(super::super::config::Produce {
             name: "test_kafka_producer".to_string(),
             brokers: "localhost:9092".to_string(),
@@ -442,15 +668,135 @@ mod tests {
             .await;
         assert!(producer.is_ok());
 
-        let (_tx2, rx2) = mpsc::channel(100);
-        let result = ProducerBuilder::new()
-            .receiver(rx2)
+        let p = producer.unwrap();
+        assert_eq!(p.config.name, "test_kafka_producer");
+        assert!(p.tx.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_producer_builder_without_sender() {
+        let config = Arc::new(super::super::config::Produce {
+            name: "leaf".to_string(),
+            brokers: "localhost:9092".to_string(),
+            topic: "leaf-topic".to_string(),
+            ..Default::default()
+        });
+        let (_tx, rx) = mpsc::channel(100);
+        let producer = ProducerBuilder::new()
+            .config(config)
+            .receiver(rx)
+            .task_id(2)
+            .task_type("leaf")
             .task_context(create_mock_task_context())
             .build()
             .await;
-        assert!(matches!(
-            result.unwrap_err(),
-            Error::MissingBuilderAttribute(_)
-        ));
+        assert!(producer.is_ok());
+        assert!(producer.unwrap().tx.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_producer_builder_missing_each_field() {
+        let full_config = || {
+            Arc::new(super::super::config::Produce {
+                name: "t".into(),
+                brokers: "b:9092".into(),
+                topic: "t".into(),
+                ..Default::default()
+            })
+        };
+        let ctx = create_mock_task_context();
+
+        // Missing config
+        let (_, rx) = mpsc::channel(10);
+        let e = ProducerBuilder::new()
+            .receiver(rx)
+            .task_context(ctx.clone())
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::MissingBuilderAttribute(attr) if attr == "config"));
+
+        // Missing receiver
+        let (tx, _) = mpsc::channel(10);
+        let e = ProducerBuilder::new()
+            .config(full_config())
+            .sender(tx)
+            .task_context(ctx.clone())
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::MissingBuilderAttribute(attr) if attr == "receiver"));
+
+        // Missing task_context
+        let (_, rx) = mpsc::channel(10);
+        let e = ProducerBuilder::new()
+            .config(full_config())
+            .receiver(rx)
+            .build()
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::MissingBuilderAttribute(attr) if attr == "task_context"));
+    }
+
+    // ------------------------------------------------------------------
+    // Config create_or_update field
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_config_create_or_update_default() {
+        let config = super::super::config::Produce::default();
+        assert!(!config.create_or_update);
+    }
+
+    #[test]
+    fn test_config_create_or_update_round_trip() {
+        let config = super::super::config::Produce {
+            name: "test".into(),
+            brokers: "b:9092".into(),
+            topic: "t".into(),
+            create_or_update: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: super::super::config::Produce =
+            serde_json::from_str(&json).unwrap();
+        assert!(deserialized.create_or_update);
+    }
+
+    // ------------------------------------------------------------------
+    // message_key id fallback
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_event_id_patches_null_id() {
+        let mut event_value = serde_json::json!({
+            "event": { "id": null, "subject": "s", "data": 42 }
+        });
+        ensure_event_id(&mut event_value);
+        let id = event_value["event"]["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        uuid::Uuid::parse_str(id).is_ok().then_some(()).unwrap();
+    }
+
+    #[test]
+    fn test_ensure_event_id_preserves_existing_id() {
+        let mut event_value = serde_json::json!({
+            "event": { "id": "existing-id", "subject": "s" }
+        });
+        ensure_event_id(&mut event_value);
+        assert_eq!(event_value["event"]["id"], "existing-id");
+    }
+
+    #[test]
+    fn test_message_key_template_resolves_fallback_id() {
+        let mut event_value = serde_json::json!({
+            "event": { "id": null, "subject": "s", "data": 42 }
+        });
+        ensure_event_id(&mut event_value);
+        let rendered =
+            flowgen_core::config::render_template("key-{{event.id}}", &event_value).unwrap();
+        let id = event_value["event"]["id"].as_str().unwrap();
+        assert_eq!(rendered, format!("key-{id}"));
+        assert_ne!(rendered, "key-");
     }
 }

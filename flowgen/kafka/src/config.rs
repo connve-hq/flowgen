@@ -16,6 +16,10 @@ pub struct Produce {
     pub brokers: String,
     pub topic: String,
     pub message_key: Option<String>,
+    /// Whether to create the topic if it does not exist.
+    /// When false, an error is returned if the topic is absent from the cluster.
+    #[serde(default)]
+    pub create_or_update: bool,
     #[serde(default, with = "humantime_serde")]
     pub ack_timeout: Option<Duration>,
     #[serde(default)]
