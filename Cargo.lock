@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "flowgen_kafka"
-version = "0.132.0"
+version = "0.134.0"
 dependencies = [
  "arrow",
  "async-trait",

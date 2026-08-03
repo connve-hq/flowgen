@@ -292,10 +292,10 @@ impl flowgen_core::task::runner::Runner for Producer {
             .render(&serde_json::json!({}))
             .map_err(|source| Error::ConfigRender { source })?;
 
-        let kafka_key = flowgen_core::client_registry::ClientKey::new(&(
-            &init_config.credentials_path,
-            &init_config.brokers,
-        ));
+        let kafka_key = flowgen_core::client_registry::ClientKeyBuilder::new(self.task_type)
+            .field("credentials_path", &init_config.credentials_path)
+            .field("brokers", &init_config.brokers)
+            .build();
         let producer = self
             .task_context
             .client_registry
