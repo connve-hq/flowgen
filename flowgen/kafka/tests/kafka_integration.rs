@@ -135,7 +135,9 @@ async fn produce_round_trips_through_real_kafka() {
     })
     .await;
     produce_tx
-        .send(drive_event(serde_json::json!({"name": "Ada", "status": "active"})))
+        .send(drive_event(
+            serde_json::json!({"name": "Ada", "status": "active"}),
+        ))
         .await
         .expect("send produce event");
     let result = tokio::time::timeout(Duration::from_secs(10), produce_rx.recv())
@@ -278,17 +280,14 @@ async fn produce_emits_one_result_per_message() {
             .expect("poll ok");
         let payload: serde_json::Value =
             serde_json::from_slice(message.payload().expect("payload")).expect("json payload");
-        assert_eq!(
-            payload.get("name").and_then(|v| v.as_str()),
-            Some(expected)
-        );
+        assert_eq!(payload.get("name").and_then(|v| v.as_str()), Some(expected));
         offsets.push(message.offset());
 
         // The incoming events carry no id, so the producer patches a UUID
         // v7 fallback into the render context; the rendered message key
         // must therefore be `key-<uuid>`.
-        let key = std::str::from_utf8(message.key().expect("message key"))
-            .expect("utf8 message key");
+        let key =
+            std::str::from_utf8(message.key().expect("message key")).expect("utf8 message key");
         let id = key
             .strip_prefix("key-")
             .expect("rendered key carries the template prefix");

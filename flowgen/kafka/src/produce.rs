@@ -146,7 +146,10 @@ async fn setup_topic(
         .fetch_metadata(Some(topic), std::time::Duration::from_secs(10))
         .map_err(|e| Error::MetadataFetch { source: e })?;
 
-    let exists = metadata.topics().iter().any(|t| t.name() == topic && t.error().is_none());
+    let exists = metadata
+        .topics()
+        .iter()
+        .any(|t| t.name() == topic && t.error().is_none());
 
     if exists {
         return Ok(());
@@ -155,9 +158,8 @@ async fn setup_topic(
     if create_or_update {
         let config = crate::client::build_base_config(credentials_path, brokers)
             .map_err(|e| Error::ClientAuth { source: e })?;
-        let admin_client: AdminClient<DefaultClientContext> = config
-            .create()
-            .map_err(|e| Error::ClientAuth {
+        let admin_client: AdminClient<DefaultClientContext> =
+            config.create().map_err(|e| Error::ClientAuth {
                 source: crate::client::Error::CreateAdminClient { source: e },
             })?;
 
@@ -210,8 +212,9 @@ impl EventHandler {
 
             let message_key = match &config.message_key {
                 Some(key_template) => {
-                    let rendered = flowgen_core::config::render_template(key_template, &event_value)
-                        .map_err(|source| Error::ConfigRender { source })?;
+                    let rendered =
+                        flowgen_core::config::render_template(key_template, &event_value)
+                            .map_err(|source| Error::ConfigRender { source })?;
                     Some(rendered)
                 }
                 None => None,
@@ -312,9 +315,7 @@ impl flowgen_core::task::runner::Runner for Producer {
             .await
             .map_err(|e| match e {
                 flowgen_core::client_registry::Error::Init { source } => source,
-                flowgen_core::client_registry::Error::TypeMismatch => {
-                    Error::ClientRegistryMismatch
-                }
+                flowgen_core::client_registry::Error::TypeMismatch => Error::ClientRegistryMismatch,
             })?;
 
         setup_topic(
@@ -552,7 +553,11 @@ mod tests {
 
     #[test]
     fn test_produce_result_round_trip() {
-        let r = ProduceResult { topic: "t".into(), partition: 2, offset: 99 };
+        let r = ProduceResult {
+            topic: "t".into(),
+            partition: 2,
+            offset: 99,
+        };
         let json = serde_json::to_value(&r).unwrap();
         let back: ProduceResult = serde_json::from_value(json).unwrap();
         assert_eq!(back.topic, "t");
@@ -758,8 +763,7 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
-        let deserialized: super::super::config::Produce =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: super::super::config::Produce = serde_json::from_str(&json).unwrap();
         assert!(deserialized.create_or_update);
     }
 

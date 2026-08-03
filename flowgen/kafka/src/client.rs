@@ -74,8 +74,14 @@ impl std::fmt::Debug for Client {
         f.debug_struct("Client")
             .field("credentials_path", &self.credentials_path)
             .field("brokers", &self.brokers)
-            .field("producer", &self.producer.as_ref().map(|_| "FutureProducer"))
-            .field("admin_client", &self.admin_client.as_ref().map(|_| "AdminClient"))
+            .field(
+                "producer",
+                &self.producer.as_ref().map(|_| "FutureProducer"),
+            )
+            .field(
+                "admin_client",
+                &self.admin_client.as_ref().map(|_| "AdminClient"),
+            )
             .finish()
     }
 }
@@ -83,13 +89,12 @@ impl std::fmt::Debug for Client {
 /// Applies SASL/SSL credentials to a `ClientConfig`.
 fn apply_credentials(config: &mut ClientConfig, path: &PathBuf) -> Result<(), Error> {
     let credentials: Credentials =
-        serde_json::from_str(
-            &std::fs::read_to_string(path)
-                .map_err(|e| Error::ReadCredentials {
-                    path: path.clone(),
-                    source: e,
-                })?,
-        )
+        serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| {
+            Error::ReadCredentials {
+                path: path.clone(),
+                source: e,
+            }
+        })?)
         .map_err(|e| Error::ParseCredentials { source: e })?;
 
     if let Some(sasl) = &credentials.sasl {
@@ -119,7 +124,10 @@ fn apply_credentials(config: &mut ClientConfig, path: &PathBuf) -> Result<(), Er
 }
 
 /// Builds a base `ClientConfig` from broker string and optional credentials path.
-pub fn build_base_config(credentials_path: &Option<PathBuf>, brokers: &str) -> Result<ClientConfig, Error> {
+pub fn build_base_config(
+    credentials_path: &Option<PathBuf>,
+    brokers: &str,
+) -> Result<ClientConfig, Error> {
     let mut config = ClientConfig::new();
     config.set("bootstrap.servers", brokers);
     config.set("message.timeout.ms", "5000");

@@ -406,10 +406,6 @@ impl CredentialHelper {
     /// Builds a gix `set_credentials` callback. The return type is
     /// dictated by the gix API; `Err` is unreachable in practice
     /// because [`Self::invoke`] never fails.
-    #[expect(
-        clippy::result_large_err,
-        reason = "gix::Connection::set_credentials fixes the Result shape"
-    )]
     fn into_gix_callback(
         self,
     ) -> impl FnMut(
