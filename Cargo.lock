@@ -2196,6 +2196,7 @@ dependencies = [
  "rdkafka",
  "serde",
  "serde_json",
+ "testcontainers",
  "thiserror 1.0.69",
  "tokio",
  "tokio-retry2",

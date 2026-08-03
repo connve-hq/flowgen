@@ -26,5 +26,8 @@ arrow = { workspace = true }
 humantime-serde = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+testcontainers = { workspace = true }
+
 [lints]
 workspace = true
