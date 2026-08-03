@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.134.0
+
+### Features
+
+- **Optional admin UI login via OIDC.** The admin web UI can now be
+  gated behind sign-in through any standard-compliant identity provider
+  (Okta, Zitadel, Auth0, or one that itself federates to an upstream
+  IdP), configured under the new `web.auth`/`web.cookie_secret`/
+  `web.cookie_secure` options. There's no server-side session store —
+  the browser's cookie holds the encrypted identity-provider tokens
+  directly, so a restart never invalidates existing sessions. Omit
+  `web.auth` and the admin UI stays unauthenticated, as before.
+
+### Fixes
+
+- **The Agents chat's selected model reset every time you left and came
+  back to a conversation.** It's now saved per conversation and
+  restored on load.
+- **Tool calls a chat agent made mid-turn disappeared once you reloaded
+  the page**, even though they rendered fine while streaming. They're
+  now persisted alongside the message and survive a reload.
+
+## 0.133.0
+
+### Fixes
+
+- **NATS JetStream subscriber could go silently stale after a pod
+  restart.** A dead connection can surface as a clean empty fetch batch
+  rather than an error, so the receive loop just kept polling forever
+  without ever re-entering the reconnect path — no error, no log, no
+  events. The subscriber now checks the underlying connection's live
+  state when a fetch comes back empty and forces a reconnect if it's
+  disconnected.
+- **Salesforce Pub/Sub subscriber could keep reusing a dead cached client
+  across reconnects.** The shared client is now evicted from the client
+  registry after a connection failure, so the next reconnect attempt
+  builds a fresh one instead of retrying against the same broken
+  connection — matching the NATS subscriber's existing behavior.
+- Reconnect-backoff logging for both subscribers is now visible at the
+  default production log level instead of `debug`, and a
+  "reconnected successfully" line is emitted once a prior failure
+  actually recovers.
+- **Leader-elected flows could all pile onto one pod instead of spreading
+  out.** Pods now hash-distribute flow ownership hints across themselves
+  before racing for a lease, so flows land roughly evenly instead of every
+  pod defaulting to whichever wins the race first. Falls back to normal
+  racing if the preferred pod doesn't show up.
+- **`mongodb_collection` reads matching zero documents left the flow
+  hanging.** The source task waited indefinitely for a completion signal
+  that never came, since an empty result set emitted no event at all. A
+  read that matches nothing now emits one event and completes normally.
+- **Two task types with matching credentials could collide in the shared
+  client registry**, causing the second one to fail with a "client
+  registry type mismatch" error. Registry keys now include the task
+  type, so different task types never share an entry.
+
+### Improvements
+
+- **MongoDB connections are now shared through the same client registry
+  NATS and Salesforce already use.** Tasks with identical credentials
+  reuse one client instead of each opening an independent connection
+  pool to the same deployment.
+- `mongodb_change_stream` and `mongodb_collection` config fields
+  (`credentials_path`, `db_name`, `collection_name`, `filter`) now
+  support template rendering, matching other task types.
+
 ## 0.132.0
 
 ### Features

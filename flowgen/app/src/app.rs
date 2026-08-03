@@ -174,6 +174,18 @@ pub enum Error {
         #[source]
         source: flowgen_core::http_server::Error,
     },
+    /// Admin UI login is enabled but has no cookie-signing secret set.
+    #[error(
+        "Admin UI login is enabled (web.auth) but web.cookie_secret is missing. Set \
+         web.cookie_secret to a random string so logged-in sessions survive a restart."
+    )]
+    MissingCookieSecret,
+    /// Admin UI could not reach or was rejected by the configured identity provider.
+    #[error("Admin UI login could not start: {source}")]
+    LoginClientStart {
+        #[source]
+        source: crate::login::LoginError,
+    },
     /// MCP server startup error.
     #[error("Failed to start MCP server: {source}")]
     McpServerStart {
@@ -904,6 +916,26 @@ impl App {
             .map(|(c, _)| Arc::clone(c))
             .unwrap_or_else(|| Arc::clone(&cache));
 
+        // Resolved once and shared via FlowBuilder so every flow's Executor
+        // and this pod's PeerRegistry agree on who "this pod" is.
+        let holder_identity = flowgen_core::executor::resolve_holder_identity();
+
+        // One instance per pod, not per flow: every flow's TaskManager
+        // consults the same registry so the peer list reflects actual pod
+        // count.
+        let peer_registry = Arc::new(flowgen_core::peer::PeerRegistry::new(
+            Arc::clone(&executor_cache),
+            holder_identity.clone(),
+        ));
+        if let Err(e) = peer_registry.register().await {
+            warn!("Failed to register peer: {}", e);
+        }
+        // Renewal is stopped by aborting this handle (below, alongside the
+        // other background handles) rather than its own cancellation token —
+        // one fewer token to keep in sync with the shutdown sequence.
+        let peer_renewal_handle =
+            peer_registry.spawn_renewal(tokio_util::sync::CancellationToken::new());
+
         // Build all flows from configuration files.
         let mut flows: Vec<super::flow::Flow> = Vec::new();
         for config in flow_configs {
@@ -913,7 +945,9 @@ impl App {
                 .config(Arc::new(config))
                 .cache(Arc::clone(&cache))
                 .system_cache(Arc::clone(&executor_cache))
-                .client_registry(Arc::clone(&client_registry));
+                .client_registry(Arc::clone(&client_registry))
+                .holder_identity(holder_identity.clone())
+                .peer_registry(Arc::clone(&peer_registry));
 
             if let Some(server) = http_server {
                 flow_builder = flow_builder.http_server(server);
@@ -991,6 +1025,7 @@ impl App {
         }
 
         let mut background_handles = Vec::new();
+        background_handles.push(peer_renewal_handle);
         if let Some(ref http_server) = http_server {
             let configured_port = app_config
                 .http_server
@@ -1144,28 +1179,60 @@ impl App {
         if let Some(web_config) = web_config.filter(|w| w.enabled) {
             let port = web_config.port;
             let path = web_config.path.clone();
-            let web_state = crate::web::WebState {
-                flow_registry: Arc::clone(&flow_registry),
-                prefix: String::new(),
-                resource_loader: resource_loader.clone(),
-                metrics_store: Arc::clone(&self.metrics_store),
-                logs_store: self.logs_store.clone(),
-                app_config: Arc::clone(&app_config),
-                // System cache (out of user-script reach) so one tenant's flow
-                // script can't read another's chats via `ctx.cache`. Falls back
-                // to the runtime cache when no system bucket is configured
-                // (single-binary/in-memory) — that mode has no tenant isolation
-                // to protect anyway.
-                conversation_cache: Arc::clone(&executor_cache),
-                system_bucket_present: system_cache.is_some(),
-                conversation_history_ttl: web_config.agents.conversation_history_ttl,
-            };
-            let web_handle = tokio::spawn(async move {
-                if let Err(source) = crate::web::start_web_server(port, &path, web_state).await {
-                    error!("{}", source);
-                }
-            });
-            background_handles.push(web_handle);
+
+            // A broken `web.auth` must not silently serve the admin UI
+            // unauthenticated, but it also shouldn't take down flow
+            // processing — so it skips starting the admin web server rather
+            // than the whole process.
+            let auth_setup: Option<(Option<Arc<crate::login::LoginClient>>, _)> =
+                match &web_config.auth {
+                    Some(login_config) => match &web_config.cookie_secret {
+                        None => {
+                            error!("{}", Error::MissingCookieSecret);
+                            None
+                        }
+                        Some(secret) => {
+                            match crate::login::LoginClient::new(login_config.clone()).await {
+                                Ok(client) => {
+                                    use secrecy::ExposeSecret;
+                                    let key = axum_extra::extract::cookie::Key::derive_from(
+                                        secret.expose_secret().as_bytes(),
+                                    );
+                                    Some((Some(Arc::new(client)), key))
+                                }
+                                Err(source) => {
+                                    error!("{}", Error::LoginClientStart { source });
+                                    None
+                                }
+                            }
+                        }
+                    },
+                    None => Some((None, axum_extra::extract::cookie::Key::generate())),
+                };
+
+            if let Some((login_client, cookie_key)) = auth_setup {
+                let web_state = crate::web::WebState {
+                    flow_registry: Arc::clone(&flow_registry),
+                    prefix: String::new(),
+                    resource_loader: resource_loader.clone(),
+                    metrics_store: Arc::clone(&self.metrics_store),
+                    logs_store: self.logs_store.clone(),
+                    app_config: Arc::clone(&app_config),
+                    conversation_cache: Arc::clone(&executor_cache),
+                    system_bucket_present: system_cache.is_some(),
+                    conversation_history_ttl: web_config.agents.conversation_history_ttl,
+                    login_client,
+                    cookie_key,
+                    cookie_secure: web_config.cookie_secure,
+                };
+                let web_handle = tokio::spawn(async move {
+                    if let Err(source) = crate::web::start_web_server(port, &path, web_state).await
+                    {
+                        error!("{}", source);
+                    }
+                });
+                background_handles.push(web_handle);
+            }
         }
 
         // Start the dedicated k8s health listener. Readiness reports true once
@@ -1216,6 +1283,8 @@ impl App {
                 filesystem_flow_paths: Arc::new(filesystem_flow_paths.clone()),
                 flow_registry: Arc::clone(&flow_registry),
                 client_registry: Arc::clone(&client_registry),
+                holder_identity: holder_identity.clone(),
+                peer_registry: Arc::clone(&peer_registry),
             };
             let reconciler_shutdown = watcher_shutdown.clone();
             let reconciler_handle = tokio::spawn(async move {
@@ -1261,6 +1330,12 @@ impl App {
             if let Err(e) = task_manager.shutdown().await {
                 warn!("Failed to shutdown task manager: {}", e);
             }
+        }
+
+        // Remove this pod from the peer list so remaining pods stop hashing
+        // flows onto it as a preferred owner.
+        if let Err(e) = peer_registry.deregister().await {
+            warn!("Failed to deregister peer: {}", e);
         }
 
         info!("Shutdown complete, all flows stopped and leases released");
