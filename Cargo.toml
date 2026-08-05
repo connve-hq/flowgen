@@ -1,5 +1,5 @@
 [workspace]
-members = ["flowgen/app", "flowgen/api/client", "charts/flowgen/tests"]
+members = ["flowgen/app", "flowgen/kafka", "flowgen/api/client", "charts/flowgen/tests"]
 # `flowgen-chart-tests` shells out to the `helm` binary, which is not
 # available in every environment. Excluding it from default-members means
 # `cargo test` at the root only touches the main app; the helm-chart tests

@@ -455,7 +455,7 @@ async fn dispatch_streaming_omits_usage_frame_when_client_does_not_opt_in() {
     .await;
 
     assert!(
-        frames.iter().position(|f| f == "[DONE]").is_some(),
+        frames.iter().any(|f| f == "[DONE]"),
         "stream must terminate with [DONE]"
     );
     // No frame before [DONE] should carry a `usage` key — byte-compat

@@ -229,6 +229,8 @@ pub enum TaskType {
     mongodb_collection(flowgen_mongodb::config::Collection),
     /// MongoDB change stream reader task.
     mongodb_change_stream(flowgen_mongodb::config::ChangeStream),
+    /// Kafka produce task.
+    kafka_produce(flowgen_kafka::config::Produce),
 }
 
 impl TaskType {
@@ -271,6 +273,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(_) => "braze_export_users_ids",
             TaskType::mongodb_collection(_) => "mongodb_collection",
             TaskType::mongodb_change_stream(_) => "mongodb_change_stream",
+            TaskType::kafka_produce(_) => "kafka_produce",
         }
     }
 
@@ -313,6 +316,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(c) => &c.name,
             TaskType::mongodb_collection(c) => &c.name,
             TaskType::mongodb_change_stream(c) => &c.name,
+            TaskType::kafka_produce(c) => &c.name,
         }
     }
 
@@ -367,6 +371,7 @@ impl TaskType {
             TaskType::braze_export_users_ids(c) => c.depends_on.as_ref(),
             TaskType::mongodb_collection(c) => c.depends_on.as_ref(),
             TaskType::mongodb_change_stream(c) => c.depends_on.as_ref(),
+            TaskType::kafka_produce(c) => c.depends_on.as_ref(),
         }
     }
 }
