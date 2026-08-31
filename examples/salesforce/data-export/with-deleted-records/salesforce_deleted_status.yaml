@@ -1,0 +1,59 @@
+# Deleted Account status updater.
+#
+# On a cron, queries Salesforce for Account records deleted in the last 7 days
+# (using the REST API get_deleted operation) and writes {Id, IsDeleted,
+# DeletedDate} markers into the BigQuery account table so deleted records are
+# flagged.
+#
+# Required:
+#   - /etc/sfdc/credentials.json
+#   - /etc/gcp/credentials.json
+#   - GCP_PROJECT_ID env var
+flow:
+  labels:
+    display_name: "Salesforce Deleted Account Status"
+    description: "On a cron, marks Account records deleted in the last 7 days in BigQuery using the REST get_deleted API."
+    tags: ["salesforce", "rest-api", "get-deleted", "bigquery", "storage-write", "cron", "example"]
+  tasks:
+
+    - generate:
+        name: cron_deleted_status
+        cron: "*/2 * * * *"
+
+    - script:
+        name: prepare_deleted_window
+        depends_on: [cron_deleted_status]
+        code: |
+          let start = timestamp_now() - (7 * 86400);
+          let end = timestamp_now();
+          #{ start_iso: timestamp_to_iso(start), end_iso: timestamp_to_iso(end) }
+
+    - salesforce_restapi_sobject:
+        name: get_deleted_accounts
+        operation: get_deleted
+        credentials_path: /etc/sfdc/credentials.json
+        sobject_type: Account
+        start: "{{event.data.start_iso}}"
+        end: "{{event.data.end_iso}}"
+        depends_on: [prepare_deleted_window]
+
+    - script:
+        name: transform_deleted
+        depends_on: [get_deleted_accounts]
+        code: |
+          let rows = [];
+          for r in event.data {
+            rows.push(#{ Id: r.id, DeletedDate: r.deleted_date, IsDeleted: true });
+          }
+          rows
+
+
+
+    - gcp_bigquery_storage_write:
+        name: write_deleted_status
+        credentials_path:
+        project_id: "cnnv-staging"
+        dataset_id: salesforce
+        table_id: deleted_records
+        depends_on: [transform_deleted]
+        change_type: upsert

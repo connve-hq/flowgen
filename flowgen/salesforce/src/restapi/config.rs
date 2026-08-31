@@ -26,6 +26,8 @@ pub enum SObjectOperation {
     Upsert,
     /// Delete a record by ID.
     Delete,
+    /// Retrieve IDs and deletion datetimes of records deleted within a time window.
+    GetDeleted,
 }
 
 /// Payload configuration for SObject operations.
@@ -93,6 +95,17 @@ pub enum Payload {
 ///     LastName: "{{event.data.last_name}}"
 ///     Email: "{{event.data.email}}"
 /// ```
+///
+/// Get records deleted within a time window:
+/// ```yaml
+/// salesforce_restapi:
+///   name: get_deleted_accounts
+///   operation: get_deleted
+///   credentials_path: /path/to/salesforce_creds.json
+///   sobject_type: Account
+///   start: "{{event.data.start_iso}}"
+///   end: "{{event.data.end_iso}}"
+/// ```
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 pub struct SObject {
     /// Unique task identifier.
@@ -125,6 +138,14 @@ pub struct SObject {
     /// External ID value (get_by_external_id, upsert).
     #[serde(default)]
     pub external_id_value: Option<String>,
+
+    // Fields for get_deleted operations.
+    /// Start datetime of the deletion window (ISO 8601) for get_deleted.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// End datetime of the deletion window (ISO 8601) for get_deleted.
+    #[serde(default)]
+    pub end: Option<String>,
 
     /// Send `Sforce-Duplicate-Rule-Header: allowSave=true` so Salesforce
     /// accepts a record even when a duplicate detection rule would
@@ -268,6 +289,10 @@ mod tests {
             serde_json::to_string(&SObjectOperation::Delete).unwrap(),
             "\"delete\""
         );
+        assert_eq!(
+            serde_json::to_string(&SObjectOperation::GetDeleted).unwrap(),
+            "\"get_deleted\""
+        );
     }
 
     #[test]
@@ -295,6 +320,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SObjectOperation>("\"delete\"").unwrap(),
             SObjectOperation::Delete
+        );
+        assert_eq!(
+            serde_json::from_str::<SObjectOperation>("\"get_deleted\"").unwrap(),
+            SObjectOperation::GetDeleted
         );
     }
 }

@@ -1,0 +1,39 @@
+# Bulk API query job creator for Account records.
+#
+# Runs on a schedule and creates a Salesforce Bulk API query job for Account
+# records created in the last 7 days. Results are picked up asynchronously by
+# the BulkApi2JobEvent listener flow (salesforce_bulk_listener_publish.yaml)
+# once Salesforce finishes the job.
+#
+# Required:
+#   - /etc/sfdc/credentials.json
+flow:
+  labels:
+    display_name: "Salesforce Account Bulk Query (last 7 days)"
+    description: "Runs on a 5-minute cron and creates a Bulk API query job for Account records created in the last 7 days."
+    tags: ["salesforce", "bulk-api", "query", "cron", "example"]
+  tasks:
+
+    - generate:
+        name: trigger
+        cron: "*/5 * * * *"
+
+    - script:
+        name: compute_window
+        code: |
+          let created_since = timestamp_now() - (7 * 86400);
+          #{ created_since_iso: timestamp_to_iso(created_since) }
+
+    - salesforce_bulkapi_query_job:
+        name: query_account
+        operation: create
+        credentials_path: /etc/sfdc/credentials.json
+        query_operation: query
+        query: |
+          SELECT Id, Name, Industry, CreatedDate, LastModifiedDate
+          FROM Account
+          WHERE CreatedDate >= {{event.data.created_since_iso}}
+          ORDER BY CreatedDate ASC
+        content_type: csv
+        column_delimiter: comma
+        line_ending: lf

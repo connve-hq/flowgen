@@ -1,0 +1,62 @@
+# Bulk API writer: consumes Account query results from NATS and writes them
+# to BigQuery via the Storage Write API.
+#
+# Consumes the results published to NATS by salesforce_bulk_listener_publish.yaml,
+# casts the Arrow schema, and writes Account records to the BigQuery account
+# table.
+#
+# Required:
+#   - /etc/nats/credentials.json
+#   - /etc/gcp/credentials.json
+#   - NATS_URL, GCP_PROJECT_ID env vars
+flow:
+  labels:
+    display_name: "Salesforce Account Bulk Writer"
+    description: "Consumes Bulk API Account results from NATS, casts the Arrow schema, and writes them to BigQuery via the Storage Write API."
+    tags: ["salesforce", "bulk-api", "bigquery", "storage-write", "example"]
+  tasks:
+
+    - nats_jetstream_subscriber:
+        name: start_subscription
+        credentials_path: /etc/nats/credentials.json
+        url: "localhost:4222"
+        subject: salesforce_bulkapi.query_jobs.account
+        stream:
+          create_or_update: true
+          name: salesforce_bulkapi
+          description: "Salesforce Bulk API query results."
+          subjects: ["salesforce_bulkapi.>"]
+          max_age: 1h
+          max_bytes: 2147483648
+          retention: limits
+          discard: old
+        durable_name: salesforce_bulkapi_account_writer
+        ack_timeout: "120s"
+        max_deliver: 5
+        backoff:
+          - "5s"
+          - "30s"
+          - "1m"
+          - "5m"
+
+    - convert:
+        name: cast_schema
+        target_format: arrow
+        schema: |
+          {
+            "fields": [
+              { "name": "Id", "data_type": "Utf8", "nullable": true, "dict_id": 0, "dict_is_ordered": false, "metadata": {} },
+              { "name": "Name", "data_type": "Utf8", "nullable": true, "dict_id": 0, "dict_is_ordered": false, "metadata": {} },
+              { "name": "Industry", "data_type": "Utf8", "nullable": true, "dict_id": 0, "dict_is_ordered": false, "metadata": {} },
+              { "name": "CreatedDate", "data_type": "Utf8", "nullable": true, "dict_id": 0, "dict_is_ordered": false, "metadata": {} },
+              { "name": "LastModifiedDate", "data_type": "Utf8", "nullable": true, "dict_id": 0, "dict_is_ordered": false, "metadata": {} }
+            ],
+            "metadata": {}
+          }
+
+    - gcp_bigquery_storage_write:
+        name: write_records
+        credentials_path: 
+        project_id: "cnnv-staging"
+        dataset_id: salesforce
+        table_id: account

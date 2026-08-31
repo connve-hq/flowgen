@@ -1,6 +1,6 @@
 //! Salesforce REST API processor.
 //!
-//! Handles SObject CRUD operations: create, get, get_by_external_id, update, upsert, and delete.
+//! Handles SObject CRUD operations: create, get, get_by_external_id, update, upsert, delete, and get_deleted.
 
 use super::config::{ALLOW_SAVE_VALUE, DUPLICATE_RULE_HEADER};
 use flowgen_core::config::ConfigExt;
@@ -49,6 +49,14 @@ pub enum Error {
     },
     #[error("Operation requires record_id field to be specified")]
     MissingRecordId,
+    #[error("Operation requires both start and end datetimes to be specified")]
+    MissingTimeWindow,
+    #[error("Invalid '{field}' datetime: {source}")]
+    InvalidDateTime {
+        field: String,
+        #[source]
+        source: chrono::ParseError,
+    },
     #[error("Operation requires payload data (explicit fields or from_event: true)")]
     MissingPayload,
     #[error("Operation requires both external_id_field and external_id_value to be specified")]
@@ -134,6 +142,9 @@ impl EventHandler {
                 }
                 super::config::SObjectOperation::Delete => {
                     self.delete(&config, completion_tx_arc).await?
+                }
+                super::config::SObjectOperation::GetDeleted => {
+                    self.get_deleted(&config, completion_tx_arc).await?
                 }
             }
 
@@ -546,6 +557,83 @@ impl EventHandler {
 
         Ok(())
     }
+
+    /// Retrieves the IDs and deletion datetimes of records of the specified
+    /// SObject type that were deleted within `[start, end)`.
+    ///
+    /// The window must be at most 30 days long and `end` cannot be in the future.
+    /// Matching records are emitted as a JSON array so downstream tasks (e.g. a
+    /// BigQuery Storage Write upsert) can consume them as rows.
+    async fn get_deleted(
+        &self,
+        config: &super::config::SObject,
+        completion_tx_arc: Option<flowgen_core::event::SharedCompletionTx>,
+    ) -> Result<(), Error> {
+        let start = config.start.as_ref().ok_or(Error::MissingTimeWindow)?;
+        let end = config.end.as_ref().ok_or(Error::MissingTimeWindow)?;
+
+        let start = chrono::DateTime::parse_from_rfc3339(start).map_err(|source| {
+            Error::InvalidDateTime {
+                field: "start".to_string(),
+                source,
+            }
+        })?;
+        let end =
+            chrono::DateTime::parse_from_rfc3339(end).map_err(|source| Error::InvalidDateTime {
+                field: "end".to_string(),
+                source,
+            })?;
+
+        let deleted = self
+            .client
+            .get_deleted(
+                &config.sobject_type,
+                start.with_timezone(&chrono::Utc),
+                end.with_timezone(&chrono::Utc),
+            )
+            .send()
+            .await
+            .map_err(|e| Error::RestApiOperation {
+                source: Box::new(e),
+            })?;
+
+        // Emit the deleted record list (a JSON array) so a downstream
+        // BigQuery Storage Write task can upsert each as a row.
+        let records: Vec<serde_json::Value> = deleted
+            .deleted_records
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "deleted_date": r.deleted_date,
+                })
+            })
+            .collect();
+
+        let mut e = EventBuilder::new()
+            .data(EventData::Json(serde_json::Value::Array(records)))
+            .subject(config.name.to_owned())
+            .task_id(self.current_task_id)
+            .task_type(self.task_type)
+            .build()?;
+
+        match self.tx {
+            None => {
+                if let Some(arc) = completion_tx_arc.as_ref() {
+                    arc.signal_completion(e.data_as_json().ok());
+                }
+            }
+            Some(_) => {
+                e.completion_tx = completion_tx_arc.clone();
+            }
+        }
+
+        e.send_with_logging(self.tx.as_ref())
+            .await
+            .map_err(|e| Error::SendMessage { source: e })?;
+
+        Ok(())
+    }
 }
 
 /// Salesforce REST API processor.
@@ -946,6 +1034,25 @@ mod tests {
             super::super::config::SObjectOperation::Delete
         );
         assert_eq!(config.record_id.as_deref(), Some("001000000000001"));
+    }
+
+    #[test]
+    fn test_config_get_deleted() {
+        let json = r#"{
+            "name": "get_deleted_accounts",
+            "operation": "get_deleted",
+            "credentials_path": "/etc/sfdc/credentials.json",
+            "sobject_type": "Account",
+            "start": "2024-01-01T00:00:00+00:00",
+            "end": "2024-01-02T00:00:00+00:00"
+        }"#;
+        let config: super::super::config::SObject = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.operation,
+            super::super::config::SObjectOperation::GetDeleted
+        );
+        assert_eq!(config.start.as_deref(), Some("2024-01-01T00:00:00+00:00"));
+        assert_eq!(config.end.as_deref(), Some("2024-01-02T00:00:00+00:00"));
     }
 
     #[test]

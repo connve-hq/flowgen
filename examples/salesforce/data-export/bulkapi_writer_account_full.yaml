@@ -1,0 +1,54 @@
+# Bulk API writer for Account query results (matches the Account table schema:
+# Id, Name, Industry, CreatedDate, LastModifiedDate — partitioned on LastModifiedDate).
+#
+# Consumes account query results from NATS, casts the Arrow schema to the 5
+# columns present in the destination BigQuery table, and writes them.
+#
+# Required:
+#   - /etc/nats/credentials.json
+#   - /etc/gcp/credentials.json
+#   - NATS_URL, GCP_PROJECT_ID env vars
+#   - resources/salesforce/schema_account_full.json
+flow:
+  labels:
+    display_name: "Salesforce Account Bulk Writer (full schema)"
+    description: "Consumes Account query results from NATS, casts to the 5-column Arrow schema, and writes to the BigQuery account table."
+    tags: ["salesforce", "bulk-api", "bigquery", "example"]
+  tasks:
+
+    - nats_jetstream_subscriber:
+        name: start_subscription
+        credentials_path: /etc/nats/credentials.json
+        url: "{{env.NATS_URL}}"
+        subject: salesforce_bulkapi.query_jobs.account
+        stream:
+          create_or_update: true
+          name: salesforce_bulkapi
+          description: "Salesforce Bulk API query results."
+          subjects: ["salesforce_bulkapi.>"]
+          max_age: 1h
+          max_bytes: 2147483648
+          retention: limits
+          discard: old
+        durable_name: salesforce_bulkapi_account_writer
+        ack_timeout: "120s"
+        max_deliver: 5
+        backoff:
+          - "5s"
+          - "30s"
+          - "1m"
+          - "5m"
+
+    - convert:
+        name: cast_schema
+        target_format: arrow
+        schema:
+          resource: salesforce/schema_account_full.json
+
+    - gcp_bigquery_storage_write:
+        name: write_to_data_warehouse
+        credentials_path: /etc/gcp/credentials.json
+        project_id: "{{env.GCP_PROJECT_ID}}"
+        dataset_id: salesforce
+        table_id: account
+        depends_on: [cast_schema]
