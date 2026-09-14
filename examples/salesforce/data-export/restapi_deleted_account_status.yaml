@@ -1,0 +1,69 @@
+# Marks deleted Account records in the data warehouse.
+#
+# Salesforce removes deleted records from query results, so a warehouse
+# populated by the Bulk API export flows never learns that a row is gone.
+# This flow polls the REST API for records deleted in a recent window and
+# upserts a deletion marker for each one, keyed on the record ID.
+#
+# The window deliberately overlaps between runs: Salesforce only retains
+# deleted records for a limited period, and re-reporting a deletion is
+# harmless because the write is an upsert.
+#
+# Required:
+#   - /etc/sfdc/credentials.json
+#   - /etc/gcp/credentials.json
+#   - GCP_PROJECT_ID env var
+flow:
+  labels:
+    display_name: "Salesforce Deleted Account Status"
+    description: "Polls the REST API for recently deleted Account records and upserts deletion markers into the BigQuery account table."
+    tags: ["salesforce", "rest-api", "bigquery", "example"]
+  require_leader_election: true
+  tasks:
+
+    - generate:
+        name: trigger
+        cron: "*/15 * * * *"
+
+    - script:
+        name: prepare_window
+        code: |
+          // Look back further than the cron interval so a skipped or failed
+          // run does not leave a deletion unrecorded.
+          let end = timestamp_now();
+          let start = end - 86400;
+          #{ start_iso: timestamp_to_iso(start), end_iso: timestamp_to_iso(end) }
+
+    - salesforce_restapi_sobject:
+        name: get_deleted_accounts
+        operation: get_deleted
+        credentials_path: /etc/sfdc/credentials.json
+        sobject_type: Account
+        start: "{{event.data.start_iso}}"
+        end: "{{event.data.end_iso}}"
+        depends_on: [prepare_window]
+
+    - script:
+        name: build_deletion_markers
+        depends_on: [get_deleted_accounts]
+        code: |
+          // get_deleted emits an array of { id, deleted_date }; an empty
+          // window yields an empty array and nothing is written.
+          let rows = [];
+          for record in event.data {
+            rows.push(#{
+              Id: record.id,
+              IsDeleted: true,
+              DeletedDate: record.deleted_date,
+            });
+          }
+          rows
+
+    - gcp_bigquery_storage_write:
+        name: write_deletion_markers
+        credentials_path: /etc/gcp/credentials.json
+        project_id: "{{env.GCP_PROJECT_ID}}"
+        dataset_id: salesforce
+        table_id: account
+        change_type: upsert
+        depends_on: [build_deletion_markers]

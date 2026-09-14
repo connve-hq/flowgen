@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.136.0
+
+### Features
+
+- **`salesforce_restapi_sobject` gained a `get_deleted` operation.** Deleted
+  records disappear from query results, so an exported table keeps serving rows
+  that no longer exist upstream. The operation takes a `start` and `end` window
+  (RFC 3339, templatable) and emits a JSON array of `{ id, deleted_date }`
+  objects for a downstream upsert to mark as deleted. A window whose `end` is
+  not after its `start` is rejected before the request is sent. See
+  `examples/salesforce/data-export/restapi_deleted_account_status.yaml`.
+
 ## 0.135.0
 
 ### Breaking

@@ -24,7 +24,7 @@ CRUD operations on Salesforce SObjects, composite batch operations, and SOSL sea
 
 ## SObject operations
 
-Single-record operations: create, get, get_by_external_id, update, upsert, delete.
+Single-record operations: create, get, get_by_external_id, update, upsert, delete, get_deleted.
 
 ```yaml
 - salesforce_restapi_sobject:
@@ -42,7 +42,7 @@ Single-record operations: create, get, get_by_external_id, update, upsert, delet
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `name` | string | required | Task name. |
-| `operation` | string | required | `create`, `get`, `get_by_external_id`, `update`, `upsert`, `delete`. |
+| `operation` | string | required | `create`, `get`, `get_by_external_id`, `update`, `upsert`, `delete`, `get_deleted`. |
 | `credentials_path` | string | required | Path to Salesforce credentials. |
 | `sobject_type` | string | required | SObject type (e.g., `Account`, `Contact`). |
 | `payload` | object | | Record fields — explicit values or `from_event: true`. |
@@ -50,6 +50,8 @@ Single-record operations: create, get, get_by_external_id, update, upsert, delet
 | `fields` | string | | Comma-separated field list (for get). |
 | `external_id_field` | string | | External ID field name (for upsert, get_by_external_id). |
 | `external_id_value` | string | | External ID value. Supports templating. |
+| `start` | string | | Start of the deletion window, RFC 3339 (for get_deleted). Supports templating. |
+| `end` | string | | End of the deletion window, RFC 3339 (for get_deleted). Supports templating. |
 | `allow_duplicate_save` | bool | `false` | Send `Sforce-Duplicate-Rule-Header: allowSave=true` so the request bypasses Salesforce duplicate-detection rules. See [Duplicate-rule override](#duplicate-rule-override). |
 | `depends_on` | list | | Upstream task names. |
 | `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |
@@ -82,6 +84,24 @@ Single-record operations: create, get, get_by_external_id, update, upsert, delet
     record_id: "{{event.data.account_id}}"
     fields: "Id,Name,Industry"
 ```
+
+**Get records deleted in a time window:**
+
+```yaml
+- salesforce_restapi_sobject:
+    name: get_deleted_accounts
+    operation: get_deleted
+    credentials_path: /etc/salesforce/credentials.json
+    sobject_type: Account
+    start: "{{event.data.start_iso}}"
+    end: "{{event.data.end_iso}}"
+```
+
+`start` and `end` are RFC 3339 datetimes. An `end` that is not after `start`
+is rejected before the request is sent; any further limits on the window are
+enforced by Salesforce. The task emits a JSON array of
+`{ id, deleted_date }` objects, which is empty when nothing was deleted in
+the window.
 
 ## Composite operations
 
