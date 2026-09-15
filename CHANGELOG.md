@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.137.0
+
+### Fixes
+
+- **`rustls` upgraded to 0.23.45 (RUSTSEC-2026-0285, severity medium
+  5.3).** `rustls 0.23.38` accepts TLS 1.3 handshake messages across
+  encryption level boundaries. Lockfile only; no API change.
+- **BigQuery connections stay alive across idle periods.** The gRPC channels
+  send HTTP/2 keepalive pings while idle, and the HTTP client sets TCP keepalive
+  and an idle timeout on pooled connections. A scheduled flow's first call
+  after a quiet period reaches an open connection instead of failing with
+  `operation was cancelled` / `connection closed` on
+  `gcp_bigquery_storage_write` or `error decoding response body` on
+  `gcp_bigquery_query`. Because the pools are shared, this failed every
+  concurrent call in a run at once. Affects `gcp_bigquery_query`,
+  `gcp_bigquery_job`, `gcp_bigquery_storage_read`, and
+  `gcp_bigquery_storage_write`.
+
+### Internal
+
+- **Connection keepalive values come from one place.** The BigQuery client
+  reads `DEFAULT_KEEP_ALIVE_INTERVAL_SECS` and `DEFAULT_KEEP_ALIVE_TIMEOUT_SECS`
+  from `flowgen_core::service`, which gains `DEFAULT_POOL_IDLE_TIMEOUT_SECS`
+  for pooled HTTP connections.
+- **The dev profile builds with line tables instead of full debuginfo.**
+  Panic and test-failure backtraces still resolve to source lines.
+- **The MongoDB integration tests retry a failed image pull.** A CI runner
+  fetches the image over the network on every run, and testcontainers treats a
+  transfer that dies mid-stream as terminal. Other start failures are still
+  reported on the first attempt.
+
 ## 0.136.0
 
 ### Features
