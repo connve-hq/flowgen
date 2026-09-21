@@ -4,13 +4,12 @@
 //! with MongoDB in two distinct modes:
 //!
 //! 1. **Collection (`Collection`):** CRUD-style operations against a collection
-//!    (`read`, `write`, and future operations like `upsert`/`delete`).
+//!    (`read`, `write`, `upsert`, and future operations like `delete`).
 //! 2. **Change Stream (`ChangeStream`):** Configuration for Change Data Capture (CDC)
 //!    to listen for real-time changes.
 
 use flowgen_core::config::ConfigExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Operation performed against a MongoDB collection.
@@ -21,9 +20,12 @@ pub enum Operation {
     Read,
     /// Insert the incoming event's JSON payload as a document.
     Write,
+    /// Update the first document matching `filter` with the incoming event's
+    /// JSON payload, inserting a document if nothing matches.
+    Upsert,
 }
 
-/// MongoDB collection task configuration: read or write documents.
+/// MongoDB collection task configuration: read, write, or upsert documents.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Collection {
@@ -39,9 +41,10 @@ pub struct Collection {
     pub db_name: String,
     /// The Collection Name from MongoDB.
     pub collection_name: String,
-    /// Key-value pairs to filter documents. Only used by `operation: read`.
+    /// MongoDB query document selecting which documents the operation acts
+    /// on. Used by `operation: read`, and required by `operation: upsert`.
     #[serde(default)]
-    pub filter: HashMap<String, String>,
+    pub filter: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub depends_on: Option<Vec<String>>,
     /// Optional retry configuration (overrides app-level retry config).
@@ -82,7 +85,7 @@ mod tests {
             credentials_path: Some(PathBuf::from("/tmp/creds.json")),
             db_name: "db".to_string(),
             collection_name: "col".to_string(),
-            filter: HashMap::new(),
+            filter: serde_json::Map::new(),
             depends_on: None,
             retry: None,
         }
@@ -91,7 +94,7 @@ mod tests {
     #[test]
     fn test_collection_read_serde_roundtrip() {
         let mut c = fixture(Operation::Read);
-        c.filter.insert("status".to_string(), "active".to_string());
+        c.filter.insert("status".to_string(), "active".into());
 
         let s = serde_json::to_string(&c).unwrap();
         let de: Collection = serde_json::from_str(&s).unwrap();
@@ -104,6 +107,29 @@ mod tests {
         let s = serde_json::to_string(&c).unwrap();
         let de: Collection = serde_json::from_str(&s).unwrap();
         assert_eq!(c, de);
+    }
+
+    #[test]
+    fn test_collection_upsert_serde_roundtrip() {
+        let mut c = fixture(Operation::Upsert);
+        c.filter.insert("status".to_string(), "active".into());
+
+        let s = serde_json::to_string(&c).unwrap();
+        let de: Collection = serde_json::from_str(&s).unwrap();
+        assert_eq!(c, de);
+    }
+
+    #[test]
+    fn test_filter_keeps_operators_and_value_types() {
+        let json = r#"{
+            "name": "n", "operation": "read", "credentials_path": "/c.json",
+            "db_name": "d", "collection_name": "c",
+            "filter": { "age": { "$gt": 30 }, "count": 5 }
+        }"#;
+        let c: Collection = serde_json::from_str(json).unwrap();
+
+        assert_eq!(c.filter["age"], serde_json::json!({ "$gt": 30 }));
+        assert_eq!(c.filter["count"], serde_json::json!(5));
     }
 
     #[test]

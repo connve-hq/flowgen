@@ -1,7 +1,7 @@
 //! Integration tests for the `mongodb_collection` and `mongodb_change_stream`
 //! processors against a real MongoDB server in a Docker container.
 //!
-//! Exercises `read`, `write`, and change-stream watching with the same
+//! Exercises `read`, `write`, `upsert`, and change-stream watching with the same
 //! event-flow shape a YAML task uses in production: an upstream event
 //! drives the operation, the processor emits a result event downstream.
 //! Change streams require a replica set, so the container is started as a
@@ -180,6 +180,13 @@ async fn spawn_collection_processor(
     (in_tx, out_rx)
 }
 
+fn json_filter(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => map,
+        other => panic!("filter must be an object, got {other:?}"),
+    }
+}
+
 fn drive_event(data: serde_json::Value) -> Event {
     EventBuilder::new()
         .subject("trigger".to_string())
@@ -229,7 +236,7 @@ async fn write_then_read_round_trips_through_real_mongo() {
         credentials_path: Some(credentials_path),
         db_name: "sales".to_string(),
         collection_name: "customers".to_string(),
-        filter: std::collections::HashMap::from([("status".to_string(), "active".to_string())]),
+        filter: json_filter(serde_json::json!({ "status": "active" })),
         depends_on: None,
         retry: None,
     })
@@ -257,6 +264,71 @@ async fn write_then_read_round_trips_through_real_mongo() {
 
 #[tokio::test]
 #[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn read_filter_applies_query_operators_and_value_types() {
+    let (_mongo, credentials_path) = start_mongo().await;
+
+    let (write_tx, mut write_rx) = spawn_collection_processor(Collection {
+        name: "write_people".to_string(),
+        operation: Operation::Write,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "people".to_string(),
+        filter: Default::default(),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    for (name, age) in [("Ada", 36), ("Grace", 45), ("Alan", 24)] {
+        write_tx
+            .send(drive_event(serde_json::json!({ "name": name, "age": age })))
+            .await
+            .expect("send write event");
+        tokio::time::timeout(Duration::from_secs(10), write_rx.recv())
+            .await
+            .expect("write emits result")
+            .expect("channel open");
+    }
+
+    let (read_tx, mut read_rx) = spawn_collection_processor(Collection {
+        name: "read_people".to_string(),
+        operation: Operation::Read,
+        credentials_path: Some(credentials_path),
+        db_name: "sales".to_string(),
+        collection_name: "people".to_string(),
+        filter: json_filter(serde_json::json!({ "age": { "$gt": 30 } })),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    read_tx
+        .send(drive_event(serde_json::json!({})))
+        .await
+        .expect("send read event");
+
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(10), read_rx.recv())
+            .await
+            .expect("read emits result")
+            .expect("channel open");
+        let name = event
+            .data_as_json()
+            .expect("json")
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![Some("Ada".to_string()), Some("Grace".to_string())],
+        "`$gt` must compare numerically and exclude the 24-year-old"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
 async fn read_with_no_matches_emits_no_events() {
     let (_mongo, credentials_path) = start_mongo().await;
 
@@ -266,10 +338,7 @@ async fn read_with_no_matches_emits_no_events() {
         credentials_path: Some(credentials_path),
         db_name: "sales".to_string(),
         collection_name: "customers".to_string(),
-        filter: std::collections::HashMap::from([(
-            "status".to_string(),
-            "does_not_exist".to_string(),
-        )]),
+        filter: json_filter(serde_json::json!({ "status": "does_not_exist" })),
         depends_on: None,
         retry: None,
     })
@@ -318,7 +387,7 @@ async fn read_emits_every_matching_document() {
         credentials_path: Some(credentials_path),
         db_name: "sales".to_string(),
         collection_name: "batch".to_string(),
-        filter: std::collections::HashMap::from([("batch".to_string(), "x".to_string())]),
+        filter: json_filter(serde_json::json!({ "batch": "x" })),
         depends_on: None,
         retry: None,
     })
@@ -412,5 +481,176 @@ async fn change_stream_emits_event_on_insert() {
     assert_eq!(
         change_event.get("name").and_then(|v| v.as_str()),
         Some("Grace")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn upsert_updates_matching_or_inserts_new_document() {
+    let (_mongo, credentials_path) = start_mongo().await;
+
+    let (write_tx, mut write_rx) = spawn_collection_processor(Collection {
+        name: "write_customer".to_string(),
+        operation: Operation::Write,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: Default::default(),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    write_tx
+        .send(drive_event(serde_json::json!({
+            "name": "Ada",
+            "email": "ada@example.com"
+        })))
+        .await
+        .expect("send write event");
+    let written = tokio::time::timeout(Duration::from_secs(10), write_rx.recv())
+        .await
+        .expect("write emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    let original_id = written.get("insertedId").cloned();
+
+    let (upsert_tx, mut upsert_rx) = spawn_collection_processor(Collection {
+        name: "upsert_customers".to_string(),
+        operation: Operation::Upsert,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: json_filter(serde_json::json!({ "email": "ada@example.com" })),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+
+    upsert_tx
+        .send(drive_event(serde_json::json!({
+            "_id": { "$oid": "696a1d842f9c12344cd86eab" },
+            "id": "2-updated",
+            "name": "Ada Lovelace",
+            "status": "active"
+        })))
+        .await
+        .expect("send upsert event");
+    let updated = tokio::time::timeout(Duration::from_secs(10), upsert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        updated.get("name").and_then(|v| v.as_str()),
+        Some("Ada Lovelace"),
+        "matched upsert must emit the updated document, got {updated:?}"
+    );
+    assert_eq!(
+        updated.get("status").and_then(|v| v.as_str()),
+        Some("active")
+    );
+    assert_eq!(
+        updated.get("_id"),
+        original_id.as_ref(),
+        "matched upsert must not modify _id; updated={updated:?} original={original_id:?}"
+    );
+
+    let (upsert_insert_tx, mut upsert_insert_rx) = spawn_collection_processor(Collection {
+        name: "upsert_new_customers".to_string(),
+        operation: Operation::Upsert,
+        credentials_path: Some(credentials_path.clone()),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: json_filter(serde_json::json!({ "email": "grace@example.com" })),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    upsert_insert_tx
+        .send(drive_event(serde_json::json!({
+            "_id": { "$oid": "66803022a16e6a0000edb3f9" },
+            "id": "2-updated",
+            "name": "Grace",
+            "email": "grace@example.com",
+            "status": "inactive"
+        })))
+        .await
+        .expect("send upsert event");
+    let inserted = tokio::time::timeout(Duration::from_secs(10), upsert_insert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        inserted.get("email").and_then(|v| v.as_str()),
+        Some("grace@example.com"),
+        "non-matching upsert must insert and emit the new document, got {inserted:?}"
+    );
+    assert_eq!(
+        inserted.get("status").and_then(|v| v.as_str()),
+        Some("inactive")
+    );
+    assert_eq!(
+        inserted.get("_id"),
+        Some(&serde_json::json!({ "$oid": "66803022a16e6a0000edb3f9" })),
+        "inserted document must get the payload _id"
+    );
+
+    upsert_insert_tx
+        .send(drive_event(serde_json::json!({
+            "$inc": { "visits": 1 }
+        })))
+        .await
+        .expect("send upsert event");
+    let visit_doc = tokio::time::timeout(Duration::from_secs(10), upsert_insert_rx.recv())
+        .await
+        .expect("upsert emits result")
+        .expect("channel open")
+        .data_as_json()
+        .expect("json");
+    assert_eq!(
+        visit_doc.get("visits").and_then(|v| v.as_i64()),
+        Some(1),
+        "update-operator payload must be applied verbatim, got {visit_doc:?}"
+    );
+
+    let (read_tx, mut read_rx) = spawn_collection_processor(Collection {
+        name: "read_customers".to_string(),
+        operation: Operation::Read,
+        credentials_path: Some(credentials_path),
+        db_name: "sales".to_string(),
+        collection_name: "customers".to_string(),
+        filter: Default::default(),
+        depends_on: None,
+        retry: None,
+    })
+    .await;
+    read_tx
+        .send(drive_event(serde_json::json!({})))
+        .await
+        .expect("send read event");
+
+    let mut names = Vec::new();
+    for _ in 0..2 {
+        let event = tokio::time::timeout(Duration::from_secs(10), read_rx.recv())
+            .await
+            .expect("read emits result")
+            .expect("channel open");
+        let name = event
+            .data_as_json()
+            .expect("json")
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        names.push(name);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![Some("Ada Lovelace".to_string()), Some("Grace".to_string())],
+        "the matched upsert must update in place, not insert a duplicate"
     );
 }

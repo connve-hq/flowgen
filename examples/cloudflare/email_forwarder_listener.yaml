@@ -36,4 +36,4 @@ flow:
           subjects: ["email.>"]
           max_age: "24h"
           retention: limits
-          discard_policy: old
+          discard: old

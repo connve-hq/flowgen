@@ -4,6 +4,7 @@ use flowgen_core::config::ConfigExt;
 use flowgen_core::event::{Event, EventData, EventExt};
 use futures::TryStreamExt;
 use mongodb::bson::{oid::ObjectId, Bson, Document as BsonDocument};
+use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use mongodb::Collection;
 use serde_json::Value;
 use std::sync::Arc;
@@ -47,6 +48,16 @@ pub enum Error {
     UnsupportedEventData,
     #[error("Invalid MongoDB document")]
     InvalidDocument,
+    #[error("Upsert requires a non-empty `filter` to identify the document")]
+    MissingUpsertFilter,
+    #[error("Upsert payload is empty — there is nothing to apply")]
+    EmptyUpsertPayload,
+    #[error(
+        "Upsert payload mixes update operators with plain fields; use either `{{\"$set\": {{...}}}}` or plain fields alone"
+    )]
+    MixedUpsertPayload,
+    #[error("Upsert returned no document")]
+    MissingUpsertedDocument,
     #[error("Event's `_id` must be an ObjectId (`{{\"$oid\": \"...\"}}`) or omitted")]
     UnsupportedIdShape,
     #[error("Invalid ObjectId in event's `_id`: {source}")]
@@ -80,6 +91,27 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether retrying this error can only produce the same failure.
+    ///
+    /// Bad config or a malformed payload does not become valid on the next
+    /// attempt, so retrying one just delays the failure by the full backoff.
+    fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Error::UnsupportedEventData
+                | Error::InvalidDocument
+                | Error::MissingUpsertFilter
+                | Error::EmptyUpsertPayload
+                | Error::MixedUpsertPayload
+                | Error::UnsupportedIdShape
+                | Error::InvalidObjectId { .. }
+                | Error::Bson { .. }
+                | Error::ConfigRender { .. }
+        )
+    }
+}
+
 /// Event handler for processing individual events against a MongoDB collection.
 pub struct EventHandler {
     client: Arc<mongodb::Client>,
@@ -99,6 +131,7 @@ impl EventHandler {
             match self.config.operation {
                 Operation::Read => self.read(&completion_tx_arc).await,
                 Operation::Write => self.write(&event, &completion_tx_arc).await,
+                Operation::Upsert => self.upsert(&event, &completion_tx_arc).await,
             }
         })
         .await
@@ -115,7 +148,7 @@ impl EventHandler {
             .database(&self.config.db_name)
             .collection(&self.config.collection_name);
 
-        let filter = build_filter_doc(&self.config.filter);
+        let filter = build_filter_doc(&self.config.filter)?;
         let mut cursor = collection
             .find(filter)
             .await
@@ -261,10 +294,75 @@ impl EventHandler {
 
         Ok(())
     }
+
+    /// Applies the incoming event's JSON payload to the first document
+    /// matching `filter`, inserting one if nothing matches.
+    async fn upsert(
+        &self,
+        event: &Arc<Event>,
+        completion_tx_arc: &Option<flowgen_core::event::SharedCompletionTx>,
+    ) -> Result<(), Error> {
+        let json = match &event.data {
+            EventData::Json(value) => value.clone(),
+            _ => return Err(Error::UnsupportedEventData),
+        };
+
+        // An empty filter matches everything: this would mutate an arbitrary
+        // document instead of inserting.
+        if self.config.filter.is_empty() {
+            return Err(Error::MissingUpsertFilter);
+        }
+
+        let payload_doc = match Bson::try_from(json).map_err(|source| Error::Bson { source })? {
+            Bson::Document(d) => d,
+            _ => return Err(Error::InvalidDocument),
+        };
+        let update_doc = build_update_doc(payload_doc)?;
+
+        let collection: Collection<BsonDocument> = self
+            .client
+            .database(&self.config.db_name)
+            .collection(&self.config.collection_name);
+
+        let options = FindOneAndUpdateOptions::builder()
+            .upsert(true)
+            .return_document(ReturnDocument::After)
+            .build();
+
+        // `upsert: true` with `ReturnDocument::After` is not expected to come
+        // back empty; a concurrent delete is the only way it can.
+        let document = collection
+            .find_one_and_update(build_filter_doc(&self.config.filter)?, update_doc)
+            .with_options(options)
+            .await
+            .map_err(|source| Error::MongoDB { source })?
+            .ok_or(Error::MissingUpsertedDocument)?;
+
+        let mut e = document
+            .to_event(self.task_type, self.task_id)
+            .map_err(|source| Error::MessageConversion { source })?;
+
+        match self.tx {
+            None => {
+                if let Some(arc) = completion_tx_arc.as_ref() {
+                    arc.signal_completion(e.data_as_json().ok());
+                }
+            }
+            Some(_) => {
+                e.completion_tx = completion_tx_arc.clone();
+            }
+        }
+
+        e.send_with_logging(self.tx.as_ref())
+            .await
+            .map_err(|source| Error::SendMessage { source })?;
+
+        Ok(())
+    }
 }
 
-/// MongoDB collection processor: reads or writes documents depending on
-/// `config.operation`.
+/// MongoDB collection processor: reads, writes, or upserts documents depending
+/// on `config.operation`.
 #[derive(Debug)]
 pub struct Processor {
     config: Arc<super::config::Collection>,
@@ -360,6 +458,10 @@ impl flowgen_core::task::runner::Runner for Processor {
                             let result = tokio_retry::Retry::spawn(retry_strategy, || async {
                                 match event_handler.handle(event.clone()).await {
                                     Ok(result) => Ok(result),
+                                    Err(e) if e.is_permanent() => {
+                                        error!(error = %e, "Failed to process MongoDB event");
+                                        Err(tokio_retry::RetryError::permanent(e))
+                                    }
                                     Err(e) => {
                                         error!(error = %e, "Failed to process MongoDB event");
                                         Err(tokio_retry::RetryError::transient(e))
@@ -393,12 +495,56 @@ impl flowgen_core::task::runner::Runner for Processor {
     }
 }
 
-fn build_filter_doc(filter: &std::collections::HashMap<String, String>) -> BsonDocument {
+fn build_filter_doc(filter: &serde_json::Map<String, Value>) -> Result<BsonDocument, Error> {
     let mut d = BsonDocument::new();
     for (key, value) in filter {
-        d.insert(key, value);
+        let bson = Bson::try_from(value.clone()).map_err(|source| Error::Bson { source })?;
+        d.insert(key, bson);
     }
-    d
+    Ok(d)
+}
+
+/// Turns an upsert payload into a MongoDB update document.
+///
+/// Mixing operators with plain fields is rejected rather than guessed at:
+/// wrapping an operator key in `$set` would write a field literally named
+/// `$inc` instead of incrementing. `_id` is immutable, so it goes to
+/// `$setOnInsert` — a `$set` on a matched document would fail the update.
+fn build_update_doc(payload: BsonDocument) -> Result<BsonDocument, Error> {
+    if payload.is_empty() {
+        return Err(Error::EmptyUpsertPayload);
+    }
+
+    let operators = payload.keys().filter(|key| key.starts_with('$')).count();
+    if operators == payload.len() {
+        return Ok(payload);
+    }
+    if operators > 0 {
+        return Err(Error::MixedUpsertPayload);
+    }
+
+    let mut set = BsonDocument::new();
+    let mut set_on_insert = BsonDocument::new();
+    for (key, value) in payload {
+        match key.as_str() {
+            "_id" => match value {
+                Bson::ObjectId(_) => set_on_insert.insert(key, value),
+                // Dropped, not stored: MongoDB generates the `_id` on insert.
+                Bson::Null => None,
+                _ => return Err(Error::UnsupportedIdShape),
+            },
+            _ => set.insert(key, value),
+        };
+    }
+
+    let mut update = BsonDocument::new();
+    if !set.is_empty() {
+        update.insert("$set", set);
+    }
+    if !set_on_insert.is_empty() {
+        update.insert("$setOnInsert", set_on_insert);
+    }
+    Ok(update)
 }
 
 /// Builder for constructing `Processor` instances.
@@ -514,16 +660,144 @@ mod tests {
 
     #[test]
     fn test_build_filter_doc_with_data() {
-        let mut filter = std::collections::HashMap::new();
-        filter.insert("status".to_string(), "active".to_string());
-        let doc = build_filter_doc(&filter);
+        let filter = json!({ "status": "active" });
+        let doc = build_filter_doc(filter.as_object().unwrap()).unwrap();
         assert_eq!(doc.get_str("status").unwrap(), "active");
     }
 
     #[test]
     fn test_build_filter_doc_empty() {
-        let filter = std::collections::HashMap::new();
-        assert!(build_filter_doc(&filter).is_empty());
+        let filter = serde_json::Map::new();
+        assert!(build_filter_doc(&filter).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_build_filter_doc_preserves_value_types() {
+        let filter = json!({ "count": 5, "active": true });
+        let doc = build_filter_doc(filter.as_object().unwrap()).unwrap();
+
+        assert_eq!(doc.get("count"), Some(&Bson::Int32(5)));
+        assert_eq!(doc.get_bool("active"), Ok(true));
+    }
+
+    #[test]
+    fn test_build_filter_doc_supports_query_operators() {
+        let filter = json!({
+            "age": { "$gt": 30 },
+            "status": { "$in": ["active", "trial"] }
+        });
+        let doc = build_filter_doc(filter.as_object().unwrap()).unwrap();
+
+        assert_eq!(
+            doc.get_document("age").unwrap().get("$gt"),
+            Some(&Bson::Int32(30))
+        );
+        assert_eq!(
+            doc.get_document("status")
+                .unwrap()
+                .get_array("$in")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_build_update_doc_wraps_plain_payload_in_set() {
+        let payload = mongodb::bson::doc! { "name": "Ada", "status": "active" };
+        let update = build_update_doc(payload).unwrap();
+
+        let set = update.get_document("$set").unwrap();
+        assert_eq!(set.get_str("name").unwrap(), "Ada");
+        assert_eq!(set.get_str("status").unwrap(), "active");
+        assert!(!update.contains_key("$setOnInsert"));
+    }
+
+    #[test]
+    fn test_build_update_doc_moves_id_to_set_on_insert() {
+        let oid = ObjectId::new();
+        let payload = mongodb::bson::doc! { "_id": oid, "name": "Ada" };
+        let update = build_update_doc(payload).unwrap();
+
+        assert_eq!(
+            update.get_document("$setOnInsert").unwrap().get("_id"),
+            Some(&Bson::ObjectId(oid))
+        );
+        assert!(!update.get_document("$set").unwrap().contains_key("_id"));
+    }
+
+    #[test]
+    fn test_build_update_doc_with_only_id_omits_empty_set() {
+        let oid = ObjectId::new();
+        let payload = mongodb::bson::doc! { "_id": oid };
+        let update = build_update_doc(payload).unwrap();
+
+        assert!(!update.contains_key("$set"));
+        assert_eq!(
+            update.get_document("$setOnInsert").unwrap().get("_id"),
+            Some(&Bson::ObjectId(oid))
+        );
+    }
+
+    #[test]
+    fn test_build_update_doc_passes_operator_payload_through() {
+        let payload = mongodb::bson::doc! { "$inc": { "visits": 1 } };
+        let update = build_update_doc(payload.clone()).unwrap();
+
+        assert_eq!(update, payload);
+    }
+
+    #[test]
+    fn test_build_update_doc_rejects_empty_payload() {
+        let result = build_update_doc(BsonDocument::new());
+        assert!(matches!(result, Err(Error::EmptyUpsertPayload)));
+    }
+
+    #[test]
+    fn test_build_update_doc_drops_null_id() {
+        let payload = mongodb::bson::doc! { "_id": Bson::Null, "name": "Ada" };
+        let update = build_update_doc(payload).unwrap();
+
+        assert!(!update.contains_key("$setOnInsert"));
+        assert_eq!(
+            update.get_document("$set").unwrap().get_str("name"),
+            Ok("Ada")
+        );
+    }
+
+    #[test]
+    fn test_build_update_doc_rejects_bare_string_id() {
+        let payload = mongodb::bson::doc! { "_id": "66803022a16e6a0000edb3f9", "name": "Ada" };
+        let result = build_update_doc(payload);
+        assert!(matches!(result, Err(Error::UnsupportedIdShape)));
+    }
+
+    #[test]
+    fn test_build_update_doc_accepts_object_id() {
+        let oid = ObjectId::parse_str("66803022a16e6a0000edb3f9").unwrap();
+        let payload = mongodb::bson::doc! { "_id": oid, "name": "Ada" };
+        let update = build_update_doc(payload).unwrap();
+
+        assert_eq!(
+            update.get_document("$setOnInsert").unwrap().get("_id"),
+            Some(&Bson::ObjectId(oid))
+        );
+    }
+
+    #[test]
+    fn test_validation_errors_are_permanent() {
+        assert!(Error::MissingUpsertFilter.is_permanent());
+        assert!(Error::EmptyUpsertPayload.is_permanent());
+        assert!(Error::MixedUpsertPayload.is_permanent());
+        assert!(Error::UnsupportedIdShape.is_permanent());
+        assert!(!Error::MissingUpsertedDocument.is_permanent());
+    }
+
+    #[test]
+    fn test_build_update_doc_rejects_mixed_payload() {
+        let payload = mongodb::bson::doc! { "$inc": { "visits": 1 }, "name": "Ada" };
+        let result = build_update_doc(payload);
+        assert!(matches!(result, Err(Error::MixedUpsertPayload)));
     }
 
     #[test]
@@ -591,6 +865,93 @@ mod tests {
 
         let result = handler.handle(event).await;
         assert!(matches!(result, Err(Error::UnsupportedEventData)));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_rejects_unsupported_event_data() {
+        let client = Arc::new(
+            mongodb::Client::with_uri_str("mongodb://localhost:27017")
+                .await
+                .unwrap(),
+        );
+        let handler = EventHandler {
+            client,
+            config: Arc::new(mock_config(Operation::Upsert)),
+            task_id: 1,
+            tx: None,
+            task_type: "test",
+        };
+
+        let schema = Arc::new(arrow::datatypes::Schema::empty());
+        let batch = arrow::record_batch::RecordBatch::new_empty(schema);
+        let event = flowgen_core::event::EventBuilder::new()
+            .data(EventData::ArrowRecordBatch(batch))
+            .subject("test".to_string())
+            .task_id(1)
+            .task_type("test")
+            .build()
+            .unwrap();
+
+        let result = handler.handle(event).await;
+        assert!(matches!(result, Err(Error::UnsupportedEventData)));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_rejects_empty_payload_before_reaching_mongo() {
+        let client = Arc::new(
+            mongodb::Client::with_uri_str("mongodb://localhost:27017")
+                .await
+                .unwrap(),
+        );
+        let mut config = mock_config(Operation::Upsert);
+        config
+            .filter
+            .insert("email".to_string(), "ada@example.com".into());
+        let handler = EventHandler {
+            client,
+            config: Arc::new(config),
+            task_id: 1,
+            tx: None,
+            task_type: "test",
+        };
+
+        let event = flowgen_core::event::EventBuilder::new()
+            .data(EventData::Json(json!({})))
+            .subject("test".to_string())
+            .task_id(1)
+            .task_type("test")
+            .build()
+            .unwrap();
+
+        let result = handler.handle(event).await;
+        assert!(matches!(result, Err(Error::EmptyUpsertPayload)));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_rejects_empty_filter() {
+        let client = Arc::new(
+            mongodb::Client::with_uri_str("mongodb://localhost:27017")
+                .await
+                .unwrap(),
+        );
+        let handler = EventHandler {
+            client,
+            config: Arc::new(mock_config(Operation::Upsert)),
+            task_id: 1,
+            tx: None,
+            task_type: "test",
+        };
+
+        let event = flowgen_core::event::EventBuilder::new()
+            .data(EventData::Json(json!({ "name": "Ada" })))
+            .subject("test".to_string())
+            .task_id(1)
+            .task_type("test")
+            .build()
+            .unwrap();
+
+        let result = handler.handle(event).await;
+        assert!(matches!(result, Err(Error::MissingUpsertFilter)));
     }
 
     #[tokio::test]

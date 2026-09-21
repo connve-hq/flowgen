@@ -23,6 +23,6 @@ flow:
           name: mongocdc
           description: "MongoDB CDC events."
           subjects: ["pubsub.data.mongocdc"]
-          max_age_secs: 86400
+          max_age: "24h"
           retention: limits
-          discard_policy: old
+          discard: old

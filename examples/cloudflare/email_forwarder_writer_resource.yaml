@@ -23,7 +23,7 @@ flow:
           subjects: ["email.>"]
           max_age: "24h"
           retention: limits
-          discard_policy: old
+          discard: old
         durable_name: cloudflare_email_forwarder_writer
         max_messages: 100
         delay: 1s
