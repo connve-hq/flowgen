@@ -19,9 +19,9 @@ flow:
           name: mongo
           description: "MongoDB document write events."
           subjects: ["pubsub.data.mongo"]
-          max_age_secs: 86400
+          max_age: "24h"
           retention: limits
-          discard_policy: old
+          discard: old
         durable_name: mongo_writer
         max_messages: 100
         delay: 1s

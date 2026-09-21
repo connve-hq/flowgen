@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.139.0
+
+### Features
+
+- **`mongodb_collection` gained an `upsert` operation.** Keeping a collection in
+  sync previously meant a read, a script to decide whether the document existed,
+  and a branch to a write. The operation applies the incoming event to the first
+  document matching `filter`, inserting one if nothing matches, in a single
+  round trip. See `examples/mongodb/collection_upsert.yaml`.
+- **`mongodb_collection` filters are now full MongoDB query documents.** `filter`
+  was a string-to-string map, so it could only test a field for equality against
+  a string — `{ "age": { "$gt": 30 } }` was impossible and `{ "count": 5 }`
+  matched the string `"5"` rather than the number. Values now keep their types
+  and any query operator works.
+
 ## 0.138.0
 
 ### Features

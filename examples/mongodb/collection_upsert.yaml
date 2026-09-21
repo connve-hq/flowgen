@@ -1,0 +1,50 @@
+# Keeps a customer record in MongoDB up to date from a stream of events:
+# each event updates the matching document, or inserts one if there is none.
+#
+# credentials_path is optional on both tasks; omit to connect
+# unauthenticated to localhost.
+flow:
+  labels:
+    display_name: "MongoDB Collection Upsert"
+    description: "Upserts customers in MongoDB by applying incoming events as update documents, then publishes the resulting document as a NATS event."
+    tags: ["mongo", "upsert", "example"]
+  tasks:
+
+    - nats_jetstream_subscriber:
+        name: consume_events
+        credentials_path: /etc/nats/credentials.json
+        url: "127.0.0.1:4222"
+        subject: pubsub.data.mongo.upsert
+        stream:
+          create_or_update: true
+          name: mongo
+          description: "MongoDB document upsert events."
+          subjects: ["pubsub.data.mongo.upsert"]
+          max_age: "24h"
+          retention: limits
+          discard: old
+        durable_name: mongo_upserter
+        max_messages: 100
+        delay: 1s
+
+    - mongodb_collection:
+        name: upsert_customers
+        operation: upsert
+        credentials_path: /etc/mongodb/credentials.json
+        db_name: sales
+        collection_name: customers
+        filter:
+          email: "ada@example.com"
+
+    - nats_jetstream_publisher:
+        name: publish_upsert_results
+        credentials_path: /etc/nats/credentials.json
+        subject: pubsub.data.mongo.upserts
+        stream:
+          create_or_update: true
+          name: mongoupserts
+          description: "MongoDB upsert result events."
+          subjects: ["pubsub.data.mongo.upserts"]
+          max_age: "24h"
+          retention: limits
+          discard: old

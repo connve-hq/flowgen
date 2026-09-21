@@ -32,6 +32,6 @@ flow:
           name: mongo
           description: "MongoDB document read events."
           subjects: ["pubsub.data.mongo"]
-          max_age_secs: 86400
+          max_age: "24h"
           retention: limits
-          discard_policy: old
+          discard: old
