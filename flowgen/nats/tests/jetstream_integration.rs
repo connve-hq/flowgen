@@ -629,3 +629,149 @@ async fn idle_subscriber_still_delivers_a_message_published_later() {
     let _ = tokio::time::timeout(Duration::from_secs(2), pub_handle).await;
     sub_handle.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn subscriber_delivers_every_message_when_the_flow_is_slow() {
+    let (_nats, url) = start_nats().await;
+    let stream = stream_options("slow_stream", "slow.subject");
+
+    let pub_config = Arc::new(JsConfig {
+        name: "publisher".to_string(),
+        url: url.clone(),
+        subject: "slow.subject".to_string(),
+        stream: Some(stream.clone()),
+        ..Default::default()
+    });
+    let (pub_tx, _pub_out_rx, pub_handle) = spawn_publisher(pub_config).await;
+
+    let total = 5;
+    for n in 0..total {
+        let event = EventBuilder::new()
+            .data(EventData::Json(serde_json::json!({ "n": n })))
+            .subject("slow.subject".to_string())
+            .task_id(0)
+            .task_type("test")
+            .build()
+            .expect("build event");
+        pub_tx.send(event).await.expect("publish event");
+    }
+
+    let sub_config = Arc::new(JsConfig {
+        name: "subscriber".to_string(),
+        url: url.clone(),
+        subject: "slow.subject".to_string(),
+        stream: Some(stream),
+        durable_name: Some("slow_consumer".to_string()),
+        max_messages_per_batch: 10,
+        batch_expires: Duration::from_secs(2),
+        ack_timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    });
+    let (sub_out_tx, mut sub_out_rx) = mpsc::channel(16);
+    let subscriber = SubscriberBuilder::new()
+        .config(sub_config)
+        .sender(sub_out_tx)
+        .task_id(1)
+        .task_type("nats_jetstream_subscriber")
+        .task_context(test_task_context())
+        .build()
+        .await
+        .expect("build subscriber");
+    let sub_handle = tokio::spawn(async move {
+        use flowgen_core::task::runner::Runner;
+        let _ = subscriber.run().await;
+    });
+
+    // Each flow takes longer than `batch_expires`, so the outstanding batch
+    // request expires while the subscriber is still on the first message.
+    let mut delivered = Vec::new();
+    for _ in 0..total {
+        let event = tokio::time::timeout(Duration::from_secs(30), sub_out_rx.recv())
+            .await
+            .expect("every published message must be delivered")
+            .expect("channel open");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(arc) = event.completion_tx.as_ref() {
+            arc.signal_completion(None);
+        }
+        delivered.push(event);
+    }
+
+    assert_eq!(delivered.len(), total);
+
+    drop(pub_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), pub_handle).await;
+    sub_handle.abort();
+}
+
+/// `max_messages_per_subject` is a retention limit, not an admission limit:
+/// without `discard_new_per_subject`, `discard: new` applies to the stream's
+/// own limits, so per-subject overflow evicts the oldest message after it was
+/// accepted. Every publish is acked with a fresh sequence and no error, so a
+/// flow that publishes more than the cap to one subject loses the earlier
+/// messages silently.
+#[tokio::test]
+#[ignore = "requires Docker daemon; run in CI via `cargo test -- --ignored`"]
+async fn per_subject_cap_evicts_older_messages_without_reporting_an_error() {
+    let (_nats, url) = start_nats().await;
+
+    let stream = StreamOptions {
+        name: "discard_new_stream".to_string(),
+        subjects: vec!["full.>".to_string()],
+        create_or_update: true,
+        retention: Some(RetentionPolicy::Limits),
+        discard: Some(DiscardPolicy::New),
+        max_messages_per_subject: Some(2),
+        ..Default::default()
+    };
+
+    let pub_config = Arc::new(JsConfig {
+        name: "publisher".to_string(),
+        url: url.clone(),
+        subject: "full.records".to_string(),
+        stream: Some(stream),
+        retry: Some(flowgen_core::retry::RetryConfig {
+            max_attempts: Some(1),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let (in_tx, mut out_rx, handle) = spawn_publisher(pub_config).await;
+
+    let mut acks = Vec::new();
+    for n in 0..4 {
+        let event = EventBuilder::new()
+            .data(EventData::Json(serde_json::json!({ "n": n })))
+            .subject("full.records".to_string())
+            .task_id(0)
+            .task_type("test")
+            .build()
+            .expect("build event");
+        in_tx.send(event).await.expect("send event");
+        let result = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("publisher reports a result")
+            .expect("channel open");
+        acks.push((result.error.clone(), result.data_as_json().ok()));
+    }
+    let errors: Vec<_> = acks.iter().map(|(e, _)| e.clone()).collect();
+
+    let info = stream_info(&url, "discard_new_stream").await;
+
+    assert_eq!(
+        info.state.messages, 2,
+        "max_messages_per_subject caps the subject at 2"
+    );
+    assert!(
+        errors.iter().all(Option::is_none),
+        "every publish is accepted, so the loss is invisible to the flow: {acks:?}"
+    );
+    assert_eq!(
+        info.state.first_sequence, 3,
+        "the two oldest messages were evicted, not the two newest rejected"
+    );
+
+    drop(in_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+}
