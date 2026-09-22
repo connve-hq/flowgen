@@ -115,6 +115,7 @@ impl Error {
                 | Error::ClientAuth { .. }
                 | Error::ClientRegistryMismatch
                 | Error::InvalidConfig { .. }
+                | Error::TopicCreation { .. }
         )
     }
 }
@@ -251,7 +252,7 @@ impl EventHandler {
         }
 
         let event = Arc::new(event);
-        let completion_tx_arc = Arc::clone(&event).completion_tx.clone();
+        let completion_tx = event.completion_tx.clone();
 
         flowgen_core::event::with_event_context(&Arc::clone(&event), async move {
             let mut event_value = serde_json::value::Value::try_from(event.as_ref())
@@ -299,12 +300,12 @@ impl EventHandler {
 
             match self.tx {
                 None => {
-                    if let Some(arc) = completion_tx_arc.as_ref() {
-                        arc.signal_completion(e.data_as_json().ok());
+                    if let Some(tx) = completion_tx.as_ref() {
+                        tx.signal_completion(e.data_as_json().ok());
                     }
                 }
                 Some(_) => {
-                    e.completion_tx = completion_tx_arc.clone();
+                    e.completion_tx = completion_tx.clone();
                 }
             }
 
