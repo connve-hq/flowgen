@@ -144,7 +144,9 @@ http_server:
 #   # same-process AI gateway on loopback; set when the gateway runs in a
 #   # separate process or pod.
 #   ai_gateway_url: "http://127.0.0.1:3002/v1"
+#   # The Agents tab and /api/agents. Omit to hide the tab.
 #   agents:
+#     enabled: true
 #     # How long a chat conversation lives in the configured cache before it
 #     # expires, refreshed on every write. Defaults to 30 days; set to 0 to
 #     # persist indefinitely. Long-term history belongs in a database via a
@@ -175,7 +177,9 @@ http_server:
 #     # Must exactly match a redirect URI registered with the IdP, and
 #     # include the `path` prefix above (here, "/flowgen").
 #     redirect_uri: "https://example.com/flowgen/auth/callback"
-#     # extra_scopes: ["groups"]
+#     # Requested next to openid, profile and email. Most providers issue a
+#     # refresh token only with offline_access.
+#     # extra_scopes: ["offline_access", "groups"]
 #     # The IdP's logout URL, with its own return URL already embedded and
 #     # registered with the IdP. flowgen appends `id_token_hint`. Unset signs
 #     # out of flowgen only, leaving the IdP session intact.
@@ -186,6 +190,34 @@ http_server:
 #   # plain-HTTP deployment (local testing, or a proxy that already
 #   # terminates TLS and is trusted to keep the connection private).
 #   # cookie_secure: false
+#   # Machine keys accepted as `Authorization: Bearer` next to the login
+#   # session: {"api_keys": [{"name": "operator-agent", "key": "..."}]}.
+#   # Keys can read and propose changes, never approve them.
+#   # api_credentials_path: "/etc/flowgen/credentials/api.json"
+#   # Change proposals for flows and resources, approved in the web UI.
+#   # authoring:
+#   #   enabled: true
+#   #   # Where changes can be proposed; a change's files must all fall in one
+#   #   # target. Paths outside every target (here flows/system/) are edited
+#   #   # in the repository only. Defaults to one target over flows/ and
+#   #   # resources/.
+#   #   targets:
+#   #     - name: platform
+#   #       paths: ["flows/platform/", "resources/platform/"]
+#   #       # Identity provider groups allowed to approve, matched against the
+#   #       # claim named by groups_claim; empty allows everyone signed in.
+#   #       approver_groups: ["platform-engineers"]
+#   #     - name: user
+#   #       paths: ["flows/user/", "resources/user/"]
+#   #       approver_groups: ["business-leads"]
+#   #       # Flow, starting with an inproc_endpoint, that publishes the
+#   #       # target's approved changes (default system/publish_workspace).
+#   #       publish_flow: system/publish_workspace
+#   #       # Report when a published change runs here (default true); turn
+#   #       # off when this target is not deployed to this instance.
+#   #       track_deployment: true
+#   #   # Claim of the signed-in user that lists their groups (default groups).
+#   #   # groups_claim: groups
 
 # Kubernetes liveness/readiness listener. Independent from the API
 # listeners so probes keep working regardless of which surfaces are

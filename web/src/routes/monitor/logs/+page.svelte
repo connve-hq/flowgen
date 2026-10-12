@@ -3,21 +3,29 @@
 	import { base } from '$app/paths';
 	import Icon from '@iconify/svelte';
 	import CopyButton from '$lib/CopyButton.svelte';
-	import { apiUrl, encodePath, type LogRecord } from '$lib/api';
+	import Badge from '$lib/Badge.svelte';
+	import StateMessage from '$lib/StateMessage.svelte';
+	import { apiUrl, encodePath, errorMessage, failure, type LogRecord } from '$lib/api';
 	import { formatRelative } from '$lib/time';
 	import { rafBatch } from '$lib/rafBatch';
 	import {
 		extractFieldSummary,
 		extractSpanSummary,
+		levelChipClass,
+		levelLabel,
+		levelVariant,
 		nonHoistedSpans,
 		timestampMs,
 	} from '$lib/logRecord';
 	import { LOGS_LIMIT_MAX, clampLogsLimit } from '$lib/logsLimit';
 	import { getLogsLimit, logsLevels, setLogsLimit } from '$lib/logsPageState.svelte';
+	import { m } from '$lib/paraglide/messages.js';
 
 	let logsLimit = $derived(getLogsLimit());
 
 	type Level = LogRecord['level'];
+
+	const LEVELS: Level[] = ['info', 'warn', 'error', 'debug', 'trace'];
 
 	// Records get a monotonic ID at insert time so `#each` can key on a
 	// stable value (indices shift when we trim the buffer, which would
@@ -97,6 +105,9 @@
 		}),
 	);
 
+	let filtering = $derived(search.trim().length > 0);
+	let loadError = $state<string | null>(null);
+
 	let startIdx = $derived(Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN));
 	let endIdx = $derived(
 		Math.min(filtered.length, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN),
@@ -137,8 +148,9 @@
 		const request = ++levelRequests[level];
 		try {
 			const res = await fetch(apiUrl(`api/logs?limit=${limit}&levels=${level}`));
-			if (!res.ok) return;
+			if (!res.ok) throw await failure(res);
 			const body = (await res.json()) as LogRecord[];
+			loadError = null;
 			if (request !== levelRequests[level] || !levelFilter[level]) return;
 			const fresh = body.map((record) => ({ id: nextId++, record }));
 			const newest = Math.max(-Infinity, ...body.map((record) => timestampMs(record) ?? -Infinity));
@@ -147,8 +159,8 @@
 					row.record.level !== level || (timestampMs(row.record) ?? -Infinity) > newest,
 			);
 			rows = trimPerLevel([...kept, ...fresh].sort(rowOrder), limit);
-		} catch {
-			// history fetch is best-effort; the SSE stream backfills.
+		} catch (err) {
+			loadError = errorMessage(err, m.logs_load_failed_title());
 		}
 	}
 
@@ -278,69 +290,20 @@
 		if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
 		return `${(ms / 60_000).toFixed(1)}m`;
 	}
-
-	function levelClasses(level: Level, active: boolean): string {
-		if (!active) return 'chip chip-inactive';
-		switch (level) {
-			case 'error':
-				return 'chip chip-error';
-			case 'warn':
-				return 'chip chip-warn';
-			case 'info':
-				return 'chip chip-info';
-			default:
-				return 'chip chip-neutral';
-		}
-	}
-
-	function levelBadgeColor(level: Level): string {
-		switch (level) {
-			case 'error':
-				return 'text-error';
-			case 'warn':
-				return 'text-warning';
-			case 'debug':
-			case 'trace':
-				return 'text-base-content/50';
-			default:
-				return 'text-primary';
-		}
-	}
-
-	function levelLabel(level: Level): string {
-		switch (level) {
-			case 'warn':
-				return 'Warn';
-			case 'error':
-				return 'Error';
-			case 'debug':
-				return 'Debug';
-			case 'trace':
-				return 'Trace';
-			default:
-				return 'Info';
-		}
-	}
 </script>
 
 <section class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
 	<div class="shrink-0 border-b border-base-200 bg-base-100 px-6 pb-4 pt-6">
 		<div class="flex flex-wrap items-center gap-2">
 			<div class="flex items-center gap-1">
-				{#each [
-					{ key: 'info' as Level, label: 'Info' },
-					{ key: 'warn' as Level, label: 'Warn' },
-					{ key: 'error' as Level, label: 'Error' },
-					{ key: 'debug' as Level, label: 'Debug' },
-					{ key: 'trace' as Level, label: 'Trace' },
-				] as { key, label } (key)}
+				{#each LEVELS as key (key)}
 					<button
 						type="button"
-						class={levelClasses(key, levelFilter[key])}
+						class="chip {levelChipClass(key, levelFilter[key])}"
 						aria-pressed={levelFilter[key]}
 						onclick={() => toggleLevel(key)}
 					>
-						<span>{label}</span>
+						<span>{levelLabel(key)}</span>
 						{#if levelFilter[key]}
 							<span
 								class="inline-block text-left tabular-nums opacity-60"
@@ -351,12 +314,12 @@
 				{/each}
 			</div>
 
-			<div class="tooltip tooltip-bottom" data-tip="Max number of results per log level">
+			<div class="tooltip tooltip-bottom" data-tip={m.logs_limit_tooltip()}>
 				<label
 					class="input input-sm flex items-center gap-1.5 border border-base-300 bg-base-100 outline-none focus-within:border-primary"
 				>
 					<Icon icon="tabler:stack-2" class="h-4 w-4 opacity-70" />
-					<span class="opacity-70">Limit</span>
+					<span class="opacity-70">{m.logs_limit()}</span>
 					<input
 						type="number"
 						min="1"
@@ -365,38 +328,38 @@
 						value={logsLimit}
 						onchange={(e) => applyLimit(e.currentTarget.valueAsNumber)}
 						class="no-spinner w-12 bg-transparent tabular-nums outline-none"
-						aria-label="Line limit"
+						aria-label={m.logs_limit_label()}
 					/>
 				</label>
 			</div>
 
 			{#if !atTop && live}
-				<div class="tooltip tooltip-bottom" data-tip="Jump to latest">
+				<div class="tooltip tooltip-bottom" data-tip={m.logs_jump_to_latest()}>
 					<button
 						type="button"
 						class="btn btn-sm btn-ghost btn-circle"
-						aria-label="Jump to latest"
+						aria-label={m.logs_jump_to_latest()}
 						onclick={resume}
 					>
 						<Icon icon="tabler:arrow-up" class="h-5 w-5" />
 					</button>
 				</div>
 			{/if}
-			<div class="tooltip tooltip-bottom" data-tip={live ? 'Pause live tail' : 'Resume live tail'}>
+			<div class="tooltip tooltip-bottom" data-tip={live ? m.logs_tail_pause() : m.logs_tail_resume()}>
 				<button
 					type="button"
 					class="btn btn-sm btn-ghost btn-circle"
-					aria-label={live ? 'Pause live tail' : 'Resume live tail'}
+					aria-label={live ? m.logs_tail_pause() : m.logs_tail_resume()}
 					onclick={() => (live = !live)}
 				>
 					<Icon icon={live ? 'tabler:player-pause' : 'tabler:player-play'} class="h-5 w-5" />
 				</button>
 			</div>
-			<div class="tooltip tooltip-bottom" data-tip="Clear view">
+			<div class="tooltip tooltip-bottom" data-tip={m.logs_clear_view()}>
 				<button
 					type="button"
 					class="btn btn-sm btn-ghost btn-circle"
-					aria-label="Clear view"
+					aria-label={m.logs_clear_view()}
 					onclick={clearView}
 				>
 					<Icon icon="tabler:x" class="h-5 w-5" />
@@ -418,13 +381,13 @@
 					<circle cx="11" cy="11" r="8" />
 					<path d="M21 21l-4.35-4.35" />
 				</svg>
-				<input type="text" placeholder="Search logs..." bind:value={search} />
+				<input type="text" placeholder={m.logs_search_placeholder()} bind:value={search} />
 				{#if search}
-					<div class="tooltip tooltip-left" data-tip="Clear search">
+					<div class="tooltip tooltip-left" data-tip={m.common_clear_search()}>
 						<button
 							type="button"
 							class="opacity-50 hover:opacity-100"
-							aria-label="Clear search"
+							aria-label={m.common_clear_search()}
 							onclick={() => (search = '')}
 						>
 							<Icon icon="tabler:x" class="h-5 w-5" />
@@ -435,75 +398,66 @@
 		</div>
 	</div>
 
-	{#if filtered.length === 0}
-		<div class="flex flex-1 items-center justify-center text-sm text-base-content/50">
-			No log records match the current filters.
-		</div>
-	{:else}
-		<!-- Column headers rendered outside the virtualized scroll area so they
-		     stay visible without a sticky header fighting the spacer math. -->
-		<div
-			class="grid shrink-0 items-center border-b border-base-300 bg-base-100 px-6 py-1.5 text-xs uppercase tracking-wide text-base-content/60"
-			style="grid-template-columns: 6rem 5rem 7rem 18rem minmax(0, 1fr); gap: 0.75rem"
-		>
-			<span>Status</span>
-			<span>When</span>
-			<span>Timestamp</span>
-			<span>Target</span>
-			<span>Message</span>
-		</div>
-		<div
-			bind:this={scrollPane}
-			bind:clientHeight={viewportHeight}
-			onscroll={onScroll}
-			class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden bg-base-100 text-xs"
-		>
-			<div style="height: {topPad}px"></div>
-			{#each visible as row (row.id)}
-				{@const record = row.record}
-				{@const isSelected = selected === record}
-				{@const tsMs = timestampMs(record)}
-				<button
-					type="button"
-					class="grid w-full items-center px-6 text-left transition-colors hover:bg-base-200 focus:outline-none focus-visible:bg-base-200 {isSelected
-						? 'bg-base-200'
-						: ''}"
-					style="grid-template-columns: 6rem 5rem 7rem 18rem minmax(0, 1fr); gap: 0.75rem; height: {ROW_HEIGHT}px"
-					onclick={() => (selected = record)}
+	<div class="flex min-h-0 flex-1 flex-col p-6">
+		{#if filtered.length === 0 && loadError}
+			<StateMessage tone="oops" title={m.logs_load_failed_title()} message={loadError} />
+		{:else if filtered.length === 0 && filtering}
+			<StateMessage tone="notice" title={m.logs_no_match_title()} message={m.logs_no_match_message()} />
+		{:else if filtered.length === 0}
+			<StateMessage tone="notice" title={m.logs_empty_title()} message={m.logs_empty_message()} />
+		{:else}
+			<div
+				class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-base-300 bg-base-100"
+			>
+				<!-- Column headers rendered outside the virtualized scroll area so they
+				     stay visible without a sticky header fighting the spacer math. -->
+				<div
+					class="grid shrink-0 items-center border-b border-base-200 px-3 py-2 text-xs font-semibold uppercase tracking-wide opacity-60"
+					style="grid-template-columns: 5rem 5rem 7rem 18rem minmax(0, 1fr); gap: 0.75rem"
 				>
-					<span class="flex items-center gap-1.5">
-						<span
-							class="inline-flex h-3 w-3 items-center justify-center rounded-full text-white"
-							class:bg-primary={record.level === 'info'}
-							class:bg-warning={record.level === 'warn'}
-							class:bg-error={record.level === 'error'}
-							class:bg-base-300={record.level === 'debug' || record.level === 'trace'}
+					<span>{m.logs_column_level()}</span>
+					<span>{m.logs_column_when()}</span>
+					<span>{m.logs_column_timestamp()}</span>
+					<span>{m.logs_column_target()}</span>
+					<span>{m.logs_column_message()}</span>
+				</div>
+				<div
+					bind:this={scrollPane}
+					bind:clientHeight={viewportHeight}
+					onscroll={onScroll}
+					class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden text-xs"
+				>
+					<div style="height: {topPad}px"></div>
+					{#each visible as row (row.id)}
+						{@const record = row.record}
+						{@const isSelected = selected === record}
+						{@const tsMs = timestampMs(record)}
+						<button
+							type="button"
+							class="grid w-full items-center border-b border-base-200 px-3 text-left transition-colors hover:bg-base-200 focus:outline-none focus-visible:bg-base-200 {isSelected
+								? 'bg-base-200'
+								: ''}"
+							style="grid-template-columns: 5rem 5rem 7rem 18rem minmax(0, 1fr); gap: 0.75rem; height: {ROW_HEIGHT}px"
+							onclick={() => (selected = record)}
 						>
-							{#if record.level === 'info'}
-								<Icon icon="tabler:check" class="h-2.5 w-2.5" />
-							{:else if record.level === 'warn'}
-								<Icon icon="tabler:exclamation-mark" class="h-2.5 w-2.5" />
-							{:else if record.level === 'error'}
-								<Icon icon="tabler:x" class="h-2.5 w-2.5" />
-							{/if}
-						</span>
-						<span class="uppercase opacity-70">{levelLabel(record.level)}</span>
-					</span>
-					<span class="whitespace-nowrap opacity-60" title={formatAbsolute(record.timestamp)}>
-						{tsMs !== null ? formatRelative(tsMs) : '—'}
-					</span>
-					<span class="whitespace-nowrap font-mono opacity-60">
-						{formatTs(record.timestamp) || '—'}
-					</span>
-					<span class="truncate font-mono text-base-content/70">
-						{record.target}
-					</span>
-					<span class="truncate font-mono" title={record.body}>{record.body}</span>
-				</button>
-			{/each}
-			<div style="height: {bottomPad}px"></div>
-		</div>
-	{/if}
+							<span><Badge variant={levelVariant(record.level)}>{levelLabel(record.level)}</Badge></span>
+							<span class="whitespace-nowrap opacity-70" title={formatAbsolute(record.timestamp)}>
+								{tsMs !== null ? formatRelative(tsMs) : '—'}
+							</span>
+							<span class="whitespace-nowrap font-mono opacity-70">
+								{formatTs(record.timestamp) || '—'}
+							</span>
+							<span class="truncate font-mono opacity-70">
+								{record.target}
+							</span>
+							<span class="truncate font-mono" title={record.body}>{record.body}</span>
+						</button>
+					{/each}
+					<div style="height: {bottomPad}px"></div>
+				</div>
+			</div>
+		{/if}
+	</div>
 </section>
 
 <svelte:window on:keydown={onKeydown} />
@@ -513,26 +467,11 @@
 		class="fixed inset-y-0 right-0 z-40 flex w-full max-w-2xl flex-col border-l border-base-300 bg-base-100 shadow-2xl ring-1 ring-base-content/10"
 		role="dialog"
 		aria-modal="true"
-		aria-label="Log record detail"
+		aria-label={m.logs_detail_label()}
 	>
 		<div class="flex items-center justify-between border-b border-base-300 px-4 py-2">
 			<div class="flex items-center gap-2 text-xs">
-				<span
-					class="inline-flex h-3 w-3 items-center justify-center rounded-full text-white"
-					class:bg-primary={selected.level === 'info'}
-					class:bg-warning={selected.level === 'warn'}
-					class:bg-error={selected.level === 'error'}
-					class:bg-base-300={selected.level === 'debug' || selected.level === 'trace'}
-				>
-					{#if selected.level === 'info'}
-						<Icon icon="tabler:check" class="h-2.5 w-2.5" />
-					{:else if selected.level === 'warn'}
-						<Icon icon="tabler:exclamation-mark" class="h-2.5 w-2.5" />
-					{:else if selected.level === 'error'}
-						<Icon icon="tabler:x" class="h-2.5 w-2.5" />
-					{/if}
-				</span>
-				<span class="uppercase opacity-70">{levelLabel(selected.level)}</span>
+				<Badge variant={levelVariant(selected.level)}>{levelLabel(selected.level)}</Badge>
 				{#if selectedSummary?.task_type}
 					<span class="opacity-40">•</span>
 					<span class="font-mono opacity-70">{selectedSummary.task_type}</span>
@@ -546,12 +485,12 @@
 				{/if}
 			</div>
 			<div class="flex items-center gap-1">
-				<CopyButton text={buildClipboard(selected)} label="Copy log" />
-				<div class="tooltip tooltip-left" data-tip="Close">
+				<CopyButton text={buildClipboard(selected)} label={m.logs_copy_record()} />
+				<div class="tooltip tooltip-left" data-tip={m.common_close()}>
 					<button
 						type="button"
 						class="btn btn-ghost btn-sm btn-circle"
-						aria-label="Close"
+						aria-label={m.common_close()}
 						onclick={() => (selected = null)}
 					>
 						<Icon icon="tabler:x" class="h-5 w-5" />
@@ -562,22 +501,22 @@
 
 		<div class="flex-1 overflow-y-auto">
 			<dl class="grid grid-cols-[6rem_1fr] gap-x-4 gap-y-1 px-4 py-2 text-xs">
-				<dt class="opacity-50">Timestamp</dt>
+				<dt class="opacity-50">{m.logs_column_timestamp()}</dt>
 				<dd class="font-mono">{formatAbsolute(selected.timestamp)}</dd>
 				{#if selectedTsMs !== null}
-					<dt class="opacity-50">When</dt>
+					<dt class="opacity-50">{m.logs_column_when()}</dt>
 					<dd>{formatRelative(selectedTsMs)}</dd>
 				{/if}
 				{#if selectedDurationMs !== null}
-					<dt class="opacity-50">Duration</dt>
+					<dt class="opacity-50">{m.logs_detail_duration()}</dt>
 					<dd class="font-mono tabular-nums">{formatDuration(selectedDurationMs)}</dd>
 				{/if}
 				{#if selectedEventId}
-					<dt class="opacity-50">Event</dt>
+					<dt class="opacity-50">{m.logs_detail_event()}</dt>
 					<dd class="font-mono">{selectedEventId}</dd>
 				{/if}
 				{#if selectedSummary?.flow}
-					<dt class="opacity-50">Flow</dt>
+					<dt class="opacity-50">{m.logs_detail_flow()}</dt>
 					<dd class="min-w-0">
 						<a
 							href="{base}/flows/{encodePath(selectedSummary.flow)}"
@@ -587,12 +526,12 @@
 						</a>
 					</dd>
 				{/if}
-				<dt class="opacity-50">Target</dt>
+				<dt class="opacity-50">{m.logs_column_target()}</dt>
 				<dd class="font-mono">{selected.target}</dd>
 			</dl>
 
 			<div class="border-t border-base-300 px-4 py-2">
-				<div class="pb-1 text-xs opacity-50">Message</div>
+				<div class="pb-1 text-xs opacity-50">{m.logs_column_message()}</div>
 				<pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs {selected.body
 						? 'opacity-80'
 						: 'opacity-40'}">{selected.body || '—'}</pre>
@@ -600,7 +539,7 @@
 
 			{#if selectedExtraSpans.length > 0}
 				<div class="border-t border-base-300 px-4 py-2">
-					<div class="pb-1 text-xs opacity-50">Spans</div>
+					<div class="pb-1 text-xs opacity-50">{m.logs_detail_spans()}</div>
 					<ul class="space-y-1 text-xs">
 						{#each selectedExtraSpans as span (span.name)}
 							<li>
@@ -621,7 +560,7 @@
 
 			{#if selectedExtraFields.length > 0}
 				<div class="border-t border-base-300 px-4 py-2">
-					<div class="pb-1 text-xs opacity-50">Attributes</div>
+					<div class="pb-1 text-xs opacity-50">{m.logs_detail_attributes()}</div>
 					<dl class="grid grid-cols-[10rem_minmax(0,1fr)] gap-x-4 gap-y-1 text-xs">
 						{#each selectedExtraFields as [key, value] (key)}
 							<dt class="truncate font-mono opacity-70" title={key}>{key}</dt>

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Script processor configuration.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Processor {
     /// Task name for identification.
     pub name: String,
@@ -105,6 +106,7 @@ fn default_max_function_expr_depth() -> usize {
 /// Bounds the CPU and memory a single script invocation can consume,
 /// preventing a malicious or buggy script from stalling the worker.
 #[derive(PartialEq, Eq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct RhaiLimits {
     /// Maximum number of operations the script may execute before
     /// the engine aborts it. Each Rhai operation is roughly one
@@ -149,6 +151,18 @@ impl Default for RhaiLimits {
             max_expr_depth: default_max_expr_depth(),
             max_function_expr_depth: default_max_function_expr_depth(),
         }
+    }
+}
+
+impl RhaiLimits {
+    /// Sets these limits on `engine`; several are also enforced when it compiles a script.
+    pub fn apply(&self, engine: &mut rhai::Engine) {
+        engine.set_max_operations(self.max_operations);
+        engine.set_max_call_levels(self.max_call_depth);
+        engine.set_max_string_size(self.max_string_size);
+        engine.set_max_array_size(self.max_array_size);
+        engine.set_max_map_size(self.max_map_size);
+        engine.set_max_expr_depths(self.max_expr_depth, self.max_function_expr_depth);
     }
 }
 

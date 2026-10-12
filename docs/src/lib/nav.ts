@@ -60,6 +60,7 @@ export const navigation: NavSection[] = [
 			{ title: 'Retry', href: '/concepts/retry' },
 			{ title: 'Credentials', href: '/concepts/credentials' },
 			{ title: 'Authentication', href: '/concepts/auth' },
+			{ title: 'Authoring', href: '/concepts/authoring' },
 			{ title: 'Sandboxing', href: '/concepts/sandboxing' },
 			{ title: 'Telemetry', href: '/concepts/telemetry' },
 			{ title: 'Configuration', href: '/concepts/configuration' }
@@ -75,7 +76,8 @@ export const navigation: NavSection[] = [
 			{ title: 'Iterate', href: '/core/iterate' },
 			{ title: 'Buffer', href: '/core/buffer' },
 			{ title: 'Generate', href: '/core/generate' },
-			{ title: 'Log', href: '/core/log' }
+			{ title: 'Log', href: '/core/log' },
+			{ title: 'In-Process Calls', href: '/core/inproc' }
 		]
 	},
 	{
@@ -101,7 +103,14 @@ export const navigation: NavSection[] = [
 		icon: '/icons/git.svg',
 		items: [
 			{ title: 'Overview', href: '/git' },
-			{ title: 'Git Sync', href: '/git/sync' }
+			{ title: 'Git Sync', href: '/git/sync' },
+			{ title: 'Git Push', href: '/git/push' }
+		],
+		subsections: [
+			{
+				title: 'Guides',
+				items: [{ title: 'Loading Flows', href: '/git/guides/loading-flows' }]
+			}
 		]
 	},
 	{
@@ -172,7 +181,14 @@ export const navigation: NavSection[] = [
 		icon: '/icons/oci.svg',
 		items: [
 			{ title: 'Overview', href: '/oci' },
-			{ title: 'OCI Sync', href: '/oci/sync' }
+			{ title: 'OCI Sync', href: '/oci/sync' },
+			{ title: 'OCI Push', href: '/oci/push' }
+		],
+		subsections: [
+			{
+				title: 'Guides',
+				items: [{ title: 'Loading Flows', href: '/oci/guides/loading-flows' }]
+			}
 		]
 	},
 	{

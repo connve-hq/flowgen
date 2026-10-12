@@ -47,9 +47,24 @@ pub use flowgen_core::identity::FlowIdentity;
 /// supplies from the path. The loader wraps this into a `FlowConfig` via
 /// [`FlowConfig::from_path`].
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FlowConfigRaw {
     /// Flow definition (tasks and optional labels).
     pub flow: Flow,
+}
+
+impl FlowConfigRaw {
+    /// Parses a flow file: JSON when `key` ends in `.json`, YAML otherwise.
+    pub fn parse(key: &str, content: &str) -> Result<Self, config::ConfigError> {
+        let format = match key.ends_with(".json") {
+            true => config::FileFormat::Json,
+            false => config::FileFormat::Yaml,
+        };
+        config::Config::builder()
+            .add_source(config::File::from_str(content, format))
+            .build()?
+            .try_deserialize()
+    }
 }
 
 /// Top-level configuration for an individual flow.
@@ -136,6 +151,7 @@ fn default_parallel_instances() -> usize {
 /// path (see [`FlowIdentity`]); `name` is a pure display override and does
 /// not affect identity.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Flow {
     /// Optional display-name override for the UI and log fields. Does not
     /// affect identity — see [`FlowConfig::display_name`]. Accepted for
@@ -234,6 +250,10 @@ pub enum TaskType {
     git_sync(flowgen_git::sync::config::Processor),
     /// OCI sync task for pulling flow artifacts from an OCI registry into the cache.
     oci_sync(flowgen_oci::sync::config::Processor),
+    /// Git push task for committing files and pushing them to a Git repository.
+    git_push(flowgen_git::push::config::Processor),
+    /// OCI push task for releasing files to an OCI registry as an artifact.
+    oci_push(flowgen_oci::push::config::Processor),
     /// Braze export user IDs task.
     braze_export_users_ids(flowgen_braze::export::users::config::Processor),
     /// MongoDB collection read/write task.
@@ -244,6 +264,10 @@ pub enum TaskType {
     kafka_produce(flowgen_kafka::config::Produce),
     /// Kafka subscribe task.
     kafka_subscribe(flowgen_kafka::config::Subscribe),
+    /// Source that makes the flow callable in-process at its identity.
+    inproc_endpoint(flowgen_core::task::inproc::config::Endpoint),
+    /// Calls a flow with an `inproc_endpoint` and emits its result.
+    inproc_request(flowgen_core::task::inproc::config::Request),
 }
 
 impl TaskType {
@@ -283,11 +307,15 @@ impl TaskType {
             TaskType::llm_proxy(_) => "llm_proxy",
             TaskType::git_sync(_) => "git_sync",
             TaskType::oci_sync(_) => "oci_sync",
+            TaskType::git_push(_) => "git_push",
+            TaskType::oci_push(_) => "oci_push",
             TaskType::braze_export_users_ids(_) => "braze_export_users_ids",
             TaskType::mongodb_collection(_) => "mongodb_collection",
             TaskType::mongodb_change_stream(_) => "mongodb_change_stream",
             TaskType::kafka_produce(_) => "kafka_produce",
             TaskType::kafka_subscribe(_) => "kafka_subscribe",
+            TaskType::inproc_endpoint(_) => "inproc_endpoint",
+            TaskType::inproc_request(_) => "inproc_request",
         }
     }
 
@@ -327,11 +355,15 @@ impl TaskType {
             TaskType::llm_proxy(c) => &c.name,
             TaskType::git_sync(c) => &c.name,
             TaskType::oci_sync(c) => &c.name,
+            TaskType::git_push(c) => &c.name,
+            TaskType::oci_push(c) => &c.name,
             TaskType::braze_export_users_ids(c) => &c.name,
             TaskType::mongodb_collection(c) => &c.name,
             TaskType::mongodb_change_stream(c) => &c.name,
             TaskType::kafka_produce(c) => &c.name,
             TaskType::kafka_subscribe(c) => &c.name,
+            TaskType::inproc_endpoint(c) => &c.name,
+            TaskType::inproc_request(c) => &c.name,
         }
     }
 
@@ -345,6 +377,20 @@ impl TaskType {
     /// the preceding task in the flow list.
     pub const fn has_pipeline_io(&self) -> bool {
         !matches!(self, TaskType::mcp_prompt(_) | TaskType::mcp_resource(_))
+    }
+
+    /// Whether this task registers its flow with a shared server, so the flow
+    /// must run on every pod and is never leader elected.
+    pub const fn is_blocking(&self) -> bool {
+        matches!(
+            self,
+            TaskType::http_endpoint(_)
+                | TaskType::inproc_endpoint(_)
+                | TaskType::mcp_tool(_)
+                | TaskType::mcp_resource(_)
+                | TaskType::mcp_prompt(_)
+                | TaskType::llm_proxy(_)
+        )
     }
 
     /// Returns the `depends_on` list if configured on the task.
@@ -383,11 +429,15 @@ impl TaskType {
             TaskType::llm_proxy(c) => c.depends_on.as_ref(),
             TaskType::git_sync(c) => c.depends_on.as_ref(),
             TaskType::oci_sync(c) => c.depends_on.as_ref(),
+            TaskType::git_push(c) => c.depends_on.as_ref(),
+            TaskType::oci_push(c) => c.depends_on.as_ref(),
             TaskType::braze_export_users_ids(c) => c.depends_on.as_ref(),
             TaskType::mongodb_collection(c) => c.depends_on.as_ref(),
             TaskType::mongodb_change_stream(c) => c.depends_on.as_ref(),
             TaskType::kafka_produce(c) => c.depends_on.as_ref(),
             TaskType::kafka_subscribe(c) => c.depends_on.as_ref(),
+            TaskType::inproc_endpoint(_) => None,
+            TaskType::inproc_request(c) => c.depends_on.as_ref(),
         }
     }
 }
@@ -765,9 +815,10 @@ pub struct WebOptions {
     /// on loopback. Set when the gateway runs in a separate process or pod.
     #[serde(default)]
     pub ai_gateway_url: Option<String>,
-    /// Settings for the built-in Agents chat (conversation history, etc.).
+    /// The built-in Agents chat. Omit to hide the Agents tab and disable
+    /// `/api/agents`.
     #[serde(default)]
-    pub agents: AgentsOptions,
+    pub agents: Option<AgentsOptions>,
     /// HTTP headers sent with every outbound request the web server
     /// makes (currently the Agents chat proxy to the AI gateway). Used to
     /// identify this web server to `llm_proxy`/`mcp_tool` scoping, e.g.
@@ -794,6 +845,14 @@ pub struct WebOptions {
     /// trusted to keep the connection private).
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
+    /// JSON file with machine keys (`{"api_keys": [{"name", "key"}]}`) that
+    /// `/api/*` accepts as `Authorization: Bearer <key>` alongside the login
+    /// session. Only used when `auth` is set.
+    #[serde(default)]
+    pub api_credentials_path: Option<PathBuf>,
+    /// Change proposals and their publishing. Omit to disable `/api/changes`.
+    #[serde(default)]
+    pub authoring: Option<AuthoringOptions>,
 }
 
 fn default_cookie_secure() -> bool {
@@ -813,7 +872,95 @@ impl PartialEq for WebOptions {
             && self.auth == other.auth
             && self.cookie_secret.is_some() == other.cookie_secret.is_some()
             && self.cookie_secure == other.cookie_secure
+            && self.api_credentials_path == other.api_credentials_path
+            && self.authoring == other.authoring
     }
+}
+
+/// Proposing workspace changes from the web API and publishing approved ones.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringOptions {
+    /// Whether change proposals are enabled.
+    pub enabled: bool,
+    /// Where changes can be proposed. Defaults to one `workspace` target
+    /// covering `flows/` and `resources/`.
+    #[serde(default = "default_targets")]
+    pub targets: Vec<AuthoringTarget>,
+    /// Claim of the signed-in user that lists their groups. Defaults to `groups`.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
+}
+
+/// Workspace paths changed, approved, and published together.
+#[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoringTarget {
+    /// Name shown on its changes, e.g. `user`.
+    pub name: String,
+    /// Workspace folders it covers, e.g. `flows/user/`. A path covered by several
+    /// targets belongs to the one with the most specific folder, and a change's
+    /// files must all belong to one target.
+    pub paths: Vec<String>,
+    /// Identity of the flow, starting with an `inproc_endpoint`, that publishes
+    /// an approved change. It receives `{id, target, title, author, files}`.
+    /// Defaults to `system/publish_workspace`.
+    #[serde(default = "default_publish_flow")]
+    pub publish_flow: String,
+    /// Identity provider groups whose members may approve and reject. Empty
+    /// allows every signed-in user.
+    #[serde(default)]
+    pub approver_groups: Vec<String>,
+    /// Whether a published change reports when this instance runs it. Turn off
+    /// when the target is not deployed here automatically. Defaults to `true`.
+    #[serde(default = "default_track_deployment")]
+    pub track_deployment: bool,
+}
+
+impl AuthoringOptions {
+    /// The target owning the workspace `path`: of the targets covering it, the
+    /// one with the most specific path, so `flows/system/` wins over `flows/`.
+    pub fn target_of(&self, path: &str) -> Option<&AuthoringTarget> {
+        self.targets
+            .iter()
+            .filter_map(|target| target.matched_len(path).map(|len| (len, target)))
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, target)| target)
+    }
+}
+
+impl AuthoringTarget {
+    /// Length of the longest of its paths that `path` falls under.
+    fn matched_len(&self, path: &str) -> Option<usize> {
+        self.paths
+            .iter()
+            .map(|folder| folder.trim_end_matches('/'))
+            .filter(|folder| flowgen_core::identity::within(path, folder))
+            .map(str::len)
+            .max()
+    }
+}
+
+fn default_targets() -> Vec<AuthoringTarget> {
+    vec![AuthoringTarget {
+        name: "workspace".to_string(),
+        paths: vec!["flows/".to_string(), "resources/".to_string()],
+        publish_flow: default_publish_flow(),
+        approver_groups: Vec::new(),
+        track_deployment: default_track_deployment(),
+    }]
+}
+
+fn default_publish_flow() -> String {
+    "system/publish_workspace".to_string()
+}
+
+fn default_track_deployment() -> bool {
+    true
+}
+
+fn default_groups_claim() -> String {
+    "groups".to_string()
 }
 
 fn serialize_redacted_cookie_secret<S>(
@@ -831,7 +978,10 @@ where
 
 /// Settings for the built-in Agents chat surface.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentsOptions {
+    /// Whether the Agents chat is enabled.
+    pub enabled: bool,
     /// How long a conversation lives in the configured cache before it
     /// expires. Refreshed on every write, so the window counts from the last
     /// activity. Defaults to 30 days; set to `0` to persist indefinitely.
@@ -839,14 +989,6 @@ pub struct AgentsOptions {
     /// this cache.
     #[serde(default = "default_conversation_history_ttl", with = "humantime_serde")]
     pub conversation_history_ttl: Option<Duration>,
-}
-
-impl Default for AgentsOptions {
-    fn default() -> Self {
-        Self {
-            conversation_history_ttl: default_conversation_history_ttl(),
-        }
-    }
 }
 
 /// Default conversation history TTL for the built-in Agents chat: 30 days.
@@ -1037,6 +1179,55 @@ mod tests {
             failures.len(),
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn test_authoring_enabled_uses_defaults() {
+        let yaml = "flows: {}\nweb:\n  enabled: true\n  authoring:\n    enabled: true\n";
+        let config: AppConfig = config::Config::builder()
+            .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        let authoring = config.web.unwrap().authoring.unwrap();
+        assert_eq!(authoring.targets.len(), 1);
+        let workspace = &authoring.targets[0];
+        assert_eq!(workspace.publish_flow, "system/publish_workspace");
+        assert_eq!(
+            authoring
+                .target_of("resources/s.rhai")
+                .map(|t| t.name.as_str()),
+            Some("workspace")
+        );
+        assert_eq!(authoring.groups_claim, "groups");
+    }
+
+    #[test]
+    fn a_path_belongs_to_the_most_specific_target_on_whole_folders() {
+        let target = |name: &str, path: &str| AuthoringTarget {
+            name: name.to_string(),
+            paths: vec![path.to_string()],
+            publish_flow: default_publish_flow(),
+            approver_groups: Vec::new(),
+            track_deployment: true,
+        };
+        let authoring = AuthoringOptions {
+            enabled: true,
+            targets: vec![
+                target("all", "flows/"),
+                target("system", "flows/system"),
+                target("user", "flows/user/"),
+            ],
+            groups_claim: default_groups_claim(),
+        };
+        let owner = |path: &str| authoring.target_of(path).map(|t| t.name.as_str());
+
+        assert_eq!(owner("flows/system/a.yaml"), Some("system"));
+        assert_eq!(owner("flows/user/a.yaml"), Some("user"));
+        assert_eq!(owner("flows/username/a.yaml"), Some("all"));
+        assert_eq!(owner("flows/systems.yaml"), Some("all"));
+        assert_eq!(owner("resources/a.rhai"), None);
     }
 
     #[test]

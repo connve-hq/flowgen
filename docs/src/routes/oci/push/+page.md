@@ -1,0 +1,46 @@
+# OCI Push
+
+Packs the files of an event into a single-layer OCI artifact and pushes it to a registry under one or more tags. The layer is a tar+gzip of the files at their paths, which is the layout [OCI Sync](/docs/flowgen/oci/sync) reads back.
+
+The input event carries `files`, each `{path, content}`; the output of [Git Push](/docs/flowgen/git/push) fits as it is. Paths must be relative, without `..`, and unique. The manifest uses the OCI empty config and the artifact type `application/vnd.connve.flowgen.files.v1`. Pushes from one task run one at a time.
+
+## Configuration
+
+```yaml
+- oci_push:
+    name: release
+    repository: "{{env.OCI_REPOSITORY}}"
+    tags: ["{{event.data.commit}}", "latest"]
+    annotations:
+      org.opencontainers.image.source: "{{env.GIT_REPOSITORY_URL}}"
+      org.opencontainers.image.revision: "{{event.data.commit}}"
+    credentials_path: /etc/registry/credentials.json
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `name` | string | required | Task name. |
+| `repository` | string | required | Registry and repository without a tag, e.g. `registry.example.com/team/configs`. |
+| `tags` | list | required | Tags to push the artifact under, at least one. Supports templating. Every tag is checked before anything is pushed. |
+| `annotations` | map | | Manifest annotations. Supports templating. For example, `org.opencontainers.image.source` names the source repository, which some registries use to link the package to it, and `org.opencontainers.image.revision` the commit. Annotations are part of the manifest, so they change its digest. |
+| `credentials_path` | string | | Registry credentials, in either format [OCI Sync](/docs/flowgen/oci/sync) accepts. |
+| `depends_on` | list | | Upstream task names. |
+| `retry` | object | | [Retry configuration](/docs/flowgen/concepts/retry). |
+
+Tagging every release with an immutable tag (such as the commit SHA) next to a moving one lets consumers follow the moving tag while any release can be promoted or rolled back by its own tag.
+
+## Output
+
+The input data, with `files` replaced by:
+
+| Field | Type | Description |
+|---|---|---|
+| `digest` | string | Manifest digest, the same under every tag. |
+| `references` | array | Every reference pushed, `<repository>:<tag>`. |
+
+## Examples
+
+- [`examples/oci/push_artifact.yaml`](https://github.com/connve/flowgen/blob/main/examples/oci/push_artifact.yaml) publishes files posted to a webhook.
+- [`examples/authoring/release_workspace.yaml`](https://github.com/connve/flowgen/blob/main/examples/authoring/release_workspace.yaml) releases a workspace repository at each new commit, for deployments without CI.

@@ -185,7 +185,7 @@ OpenAI-compatible LLM gateway that serves every registered `llm_proxy` flow.
 
 ## `web`
 
-Embedded web dashboard and read-only JSON API.
+Embedded web dashboard and JSON API.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -193,6 +193,18 @@ Embedded web dashboard and read-only JSON API.
 | `port` | int | `8080` | Listening port. |
 | `path` | string | `/` | Path prefix for both the UI and the API. |
 | `headers` | map of string to string | `{}` | HTTP headers sent with every outbound request the web server makes on its own behalf (currently the built-in Agents chat proxy to the AI gateway). Set this so `llm_proxy`/`mcp_tool` tasks scoped with a matching `headers` field can identify and allow the web server as a caller — see [AI Gateway](/docs/flowgen/ai/gateway) and [MCP](/docs/flowgen/ai/mcp). |
+| `agents.enabled` | bool | required | Shows the Agents tab and enables `/api/agents`. Omit `agents` to hide the tab. |
+| `agents.conversation_history_ttl` | duration | `30d` | How long a conversation is kept after its last message; `0` keeps it indefinitely. |
+| `ai_gateway_url` | string | same-process `ai_gateway` | Base URL the Agents chat is proxied to, e.g. `http://127.0.0.1:3002/v1`. Set when the AI gateway runs in another process or pod. |
+| `api_credentials_path` | string | | Machine keys the API accepts as `Authorization: Bearer` next to the login session. See [Authoring](/docs/flowgen/concepts/authoring#machine-keys). |
+| `authoring.enabled` | bool | required | Enables change proposals. See [Authoring](/docs/flowgen/concepts/authoring). |
+| `authoring.targets` | list | one `workspace` target over `flows/` and `resources/` | Where changes can be proposed. See [Targets](/docs/flowgen/concepts/authoring#targets). |
+| `authoring.targets[].name` | string | required | Name shown on the target's changes. |
+| `authoring.targets[].paths` | list of string | required | Workspace folders the target covers, e.g. `flows/user/`. |
+| `authoring.targets[].publish_flow` | string | `system/publish_workspace` | Identity of the flow, starting with an [`inproc_endpoint`](/docs/flowgen/core/inproc), that publishes the target's approved changes. |
+| `authoring.targets[].approver_groups` | list of string | `[]` | Identity provider groups whose members may approve and reject the target's changes. Empty allows every signed-in user. |
+| `authoring.targets[].track_deployment` | bool | `true` | Reports when a committed change runs on this instance. Turn off when the target is not deployed here automatically. |
+| `authoring.groups_claim` | string | `groups` | Claim of the signed-in user that lists their groups. |
 
 The API contract is defined in `openapi.yaml` and served at `<path>/api/openapi.yaml`.
 
@@ -209,6 +221,10 @@ The API contract is defined in `openapi.yaml` and served at `<path>/api/openapi.
 | `GET <path>/api/config` | Non-secret config info shown in the web UI (e.g. whether the Agents chat is configured). |
 | `POST <path>/api/agents/chat` | Proxies a chat-completion request to the AI gateway for the built-in Agents chat. Streams the response back; same-origin, so no gateway-side CORS is required. |
 | `GET <path>/api/agents/models` | Proxies `GET /models` on the AI gateway for the built-in Agents chat's model picker. |
+| `POST <path>/api/workspace/validate` | Validates flow and resource files without running them. |
+| `GET`, `POST <path>/api/changes` | List and propose workspace changes. |
+| `GET <path>/api/changes/{id}` | One change with its diff. |
+| `POST <path>/api/changes/{id}/approve`, `/reject` | Decide a pending change; a signed-in user only. |
 | `GET <path>/api/openapi.yaml` | The spec itself. |
 
 ## `health`

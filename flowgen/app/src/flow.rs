@@ -100,6 +100,12 @@ pub enum Error {
     /// Error in generate subscriber task.
     #[error(transparent)]
     GenerateSubscriber(#[from] flowgen_core::task::generate::subscriber::Error),
+    /// Error in inproc endpoint task.
+    #[error(transparent)]
+    InprocEndpoint(#[from] flowgen_core::task::inproc::endpoint::Error),
+    /// Error in inproc request task.
+    #[error(transparent)]
+    InprocRequest(#[from] flowgen_core::task::inproc::request::Error),
     /// Error in cache operations.
     #[error(transparent)]
     Cache(#[from] flowgen_nats::cache::Error),
@@ -181,6 +187,12 @@ pub enum Error {
     /// Error in OCI sync task.
     #[error(transparent)]
     OciSync(#[from] flowgen_oci::sync::processor::Error),
+    /// Error in Git push task.
+    #[error(transparent)]
+    GitPush(#[from] flowgen_git::push::processor::Error),
+    /// Error in OCI push task.
+    #[error(transparent)]
+    OciPush(#[from] flowgen_oci::push::processor::Error),
     /// Error in Braze export user IDs task.
     #[error(transparent)]
     BrazeExportUsersIds(#[from] flowgen_braze::export::users::processor::Error),
@@ -217,6 +229,72 @@ pub enum Error {
     /// Flow configuration error (duplicate task names, invalid dependencies, etc.).
     #[error("Flow configuration error: {0}")]
     ConfigError(String),
+    /// Task wiring is invalid.
+    #[error(transparent)]
+    Dag(#[from] DagError),
+}
+
+/// Invalid task wiring in a flow.
+#[derive(thiserror::Error, Debug, Clone, PartialEq)]
+pub enum DagError {
+    /// Two tasks in the flow share a name.
+    #[error("Duplicate task name '{name}' in flow")]
+    DuplicateTask { name: String },
+    /// A `depends_on` entry names no task in the flow.
+    #[error("Task '{task}' depends on unknown task '{dependency}'")]
+    UnknownDependency { task: String, dependency: String },
+    /// A `depends_on` entry names a task further down the list, which could form a cycle.
+    #[error("Task '{task}' depends on '{dependency}' which appears later in the list")]
+    LaterDependency { task: String, dependency: String },
+}
+
+/// Resolves each task's parent indices from `depends_on`, or the previous
+/// pipeline task when unset. Registration-only tasks get no implicit parent,
+/// and the implicit-parent walk skips over them.
+pub fn resolve_parents(tasks: &[TaskType]) -> Result<Vec<Vec<usize>>, DagError> {
+    let mut name_to_idx: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (idx, task_type) in tasks.iter().enumerate() {
+        if name_to_idx.insert(task_type.name(), idx).is_some() {
+            return Err(DagError::DuplicateTask {
+                name: task_type.name().to_string(),
+            });
+        }
+    }
+
+    let mut parent_indices: Vec<Vec<usize>> = Vec::with_capacity(tasks.len());
+    for (idx, task_type) in tasks.iter().enumerate() {
+        let parents = match task_type.depends_on() {
+            Some(deps) => {
+                let mut indices = Vec::with_capacity(deps.len());
+                for dep_name in deps {
+                    let parent_idx = match name_to_idx.get(dep_name.as_str()) {
+                        Some(&parent_idx) => parent_idx,
+                        None => {
+                            return Err(DagError::UnknownDependency {
+                                task: task_type.name().to_string(),
+                                dependency: dep_name.clone(),
+                            })
+                        }
+                    };
+                    if parent_idx >= idx {
+                        return Err(DagError::LaterDependency {
+                            task: task_type.name().to_string(),
+                            dependency: dep_name.clone(),
+                        });
+                    }
+                    indices.push(parent_idx);
+                }
+                indices
+            }
+            None if !task_type.has_pipeline_io() => vec![],
+            None => match (0..idx).rev().find(|&i| tasks[i].has_pipeline_io()) {
+                Some(i) => vec![i],
+                None => vec![],
+            },
+        };
+        parent_indices.push(parents);
+    }
+    Ok(parent_indices)
 }
 
 /// Descriptor for a task with its channel endpoints.
@@ -329,16 +407,6 @@ impl TaskRegistryBuilder {
         let mut task_descriptors = Vec::with_capacity(task_count);
 
         for (idx, task_type) in tasks_config.iter().enumerate() {
-            // Blocking setup tasks (webhooks, MCP registrations, LLM proxy).
-            let is_blocking = matches!(
-                task_type,
-                TaskType::http_endpoint(_)
-                    | TaskType::mcp_tool(_)
-                    | TaskType::mcp_resource(_)
-                    | TaskType::mcp_prompt(_)
-                    | TaskType::llm_proxy(_)
-            );
-
             let input_rx = if idx > 0 {
                 channels
                     .get_mut(idx - 1)
@@ -358,7 +426,7 @@ impl TaskRegistryBuilder {
                 task_type: task_type.clone(),
                 input_rx,
                 output_tx,
-                is_blocking,
+                is_blocking: task_type.is_blocking(),
                 // Linear chains have a single terminal task, so every task
                 // sees exactly one leaf in its downstream subgraph.
                 downstream_leaves: 1,
@@ -383,55 +451,7 @@ impl TaskRegistryBuilder {
     /// use a dispatcher that clones events to each child channel.
     fn build_dag(&self, tasks_config: &[TaskType]) -> Result<TaskRegistry, Error> {
         let task_count = tasks_config.len();
-
-        let mut name_to_idx: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        for (idx, task_type) in tasks_config.iter().enumerate() {
-            let name = task_type.name().to_string();
-            if name_to_idx.contains_key(&name) {
-                return Err(Error::ConfigError(format!(
-                    "Duplicate task name '{name}' in flow"
-                )));
-            }
-            name_to_idx.insert(name, idx);
-        }
-
-        // Resolve each task's parent indices from `depends_on` names.
-        // Registration-only tasks never get an implicit parent, and the
-        // implicit-parent walk skips over any earlier registration-only task
-        // so a normal task following one still chains to the last real
-        // pipeline task.
-        let mut parent_indices: Vec<Vec<usize>> = Vec::with_capacity(task_count);
-        for (idx, task_type) in tasks_config.iter().enumerate() {
-            let parents = match task_type.depends_on() {
-                Some(deps) => {
-                    let mut indices = Vec::with_capacity(deps.len());
-                    for dep_name in deps {
-                        let &parent_idx = name_to_idx.get(dep_name).ok_or_else(|| {
-                            Error::ConfigError(format!(
-                                "Task '{}' depends on unknown task '{dep_name}'",
-                                task_type.name()
-                            ))
-                        })?;
-                        if parent_idx >= idx {
-                            return Err(Error::ConfigError(format!(
-                                "Task '{}' depends on '{dep_name}' which appears later in the list",
-                                task_type.name()
-                            )));
-                        }
-                        indices.push(parent_idx);
-                    }
-                    indices
-                }
-                None if !task_type.has_pipeline_io() => vec![],
-                None => (0..idx)
-                    .rev()
-                    .find(|&i| tasks_config[i].has_pipeline_io())
-                    .map(|i| vec![i])
-                    .unwrap_or_default(),
-            };
-            parent_indices.push(parents);
-        }
+        let parent_indices = resolve_parents(tasks_config)?;
 
         // Group children by parent to identify fan-out points.
         let mut children_per_parent: std::collections::HashMap<usize, Vec<usize>> =
@@ -536,20 +556,12 @@ impl TaskRegistryBuilder {
 
         let mut task_descriptors = Vec::with_capacity(task_count);
         for (idx, task_type) in tasks_config.iter().enumerate() {
-            let is_blocking = matches!(
-                task_type,
-                TaskType::http_endpoint(_)
-                    | TaskType::mcp_tool(_)
-                    | TaskType::mcp_resource(_)
-                    | TaskType::mcp_prompt(_)
-                    | TaskType::llm_proxy(_)
-            );
             task_descriptors.push(TaskDescriptor {
                 id: idx,
                 task_type: task_type.clone(),
                 input_rx: child_rx[idx].take(),
                 output_tx: parent_tx[idx].take(),
-                is_blocking,
+                is_blocking: task_type.is_blocking(),
                 downstream_leaves: downstream_leaves[idx],
             });
         }
@@ -589,6 +601,8 @@ pub struct Flow {
     resource_loader: Option<flowgen_core::resource::ResourceLoader>,
     /// Shared client registry for deduplicating connections to external services.
     client_registry: Arc<flowgen_core::client_registry::ClientRegistry>,
+    /// Flows callable in-process, shared by every flow.
+    inproc: Arc<flowgen_core::task::inproc::registry::InprocRegistry>,
     /// This pod's holder identity, resolved once at the app level so every
     /// flow's Executor agrees on it. `None` falls back to per-flow
     /// resolution (tests).
@@ -648,21 +662,12 @@ impl Flow {
     /// If a flow contains any webhook tasks, it will always be treated as
     /// non-leader-elected by disregarding the `required_leader_election` flag.
     fn is_leader_elected(&self) -> bool {
-        let has_blocking_tasks = self.config.flow.tasks.iter().any(|task| {
-            matches!(
-                task,
-                TaskType::http_endpoint(_)
-                    | TaskType::mcp_tool(_)
-                    | TaskType::mcp_resource(_)
-                    | TaskType::mcp_prompt(_)
-                    | TaskType::llm_proxy(_)
-            )
-        });
+        let has_blocking_tasks = self.config.flow.tasks.iter().any(TaskType::is_blocking);
 
         if has_blocking_tasks {
             if self.config.flow.require_leader_election.unwrap_or(false) {
                 info!(
-                    "Flow {} contains a blocking task (webhook, MCP registration, or llm_proxy); `required_leader_election` flag will be ignored.",
+                    "Flow {} contains a blocking task (http_endpoint, inproc_endpoint, MCP registration, or llm_proxy); `require_leader_election` flag will be ignored.",
                     self.identity()
                 );
             }
@@ -755,7 +760,8 @@ impl Flow {
             .response_registry(response_registry)
             .resource_loader(self.resource_loader.clone())
             .cancellation_token(cancellation_token)
-            .client_registry(Arc::clone(&self.client_registry));
+            .client_registry(Arc::clone(&self.client_registry))
+            .inproc(Arc::clone(&self.inproc));
 
         if let Some(retry_config) = &self.retry {
             task_context_builder = task_context_builder.retry(retry_config.clone());
@@ -1321,6 +1327,45 @@ async fn spawn_task(
                             .task_id(task_id)
                             .task_type(task_type_str)
                             .task_context(task_context);
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
+        TaskType::inproc_endpoint(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder = flowgen_core::task::inproc::endpoint::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context);
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
+        TaskType::inproc_request(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder = flowgen_core::task::inproc::request::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context);
+                    if let Some(rx) = rx {
+                        builder = builder.receiver(rx);
+                    }
                     if let Some(tx) = tx {
                         builder = builder.sender(tx);
                     }
@@ -1950,6 +1995,48 @@ async fn spawn_task(
                 .instrument(span),
             )
         }
+        TaskType::git_push(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder = flowgen_git::push::processor::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context);
+                    if let Some(rx) = rx {
+                        builder = builder.receiver(rx);
+                    }
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
+        TaskType::oci_push(config) => {
+            let config = Arc::new(config);
+            tokio::spawn(
+                async move {
+                    let mut builder = flowgen_oci::push::processor::ProcessorBuilder::new()
+                        .config(config)
+                        .task_id(task_id)
+                        .task_type(task_type_str)
+                        .task_context(task_context);
+                    if let Some(rx) = rx {
+                        builder = builder.receiver(rx);
+                    }
+                    if let Some(tx) = tx {
+                        builder = builder.sender(tx);
+                    }
+                    builder.build().await?.run().await?;
+                    Ok(())
+                }
+                .instrument(span),
+            )
+        }
         TaskType::braze_export_users_ids(config) => {
             let config = Arc::new(config);
             tokio::spawn(
@@ -2084,6 +2171,8 @@ pub struct FlowBuilder {
     resource_loader: Option<flowgen_core::resource::ResourceLoader>,
     /// Shared client registry for connection pooling.
     client_registry: Option<Arc<flowgen_core::client_registry::ClientRegistry>>,
+    /// Flows callable in-process.
+    inproc: Option<Arc<flowgen_core::task::inproc::registry::InprocRegistry>>,
     /// This pod's holder identity, shared across every flow's Executor.
     holder_identity: Option<String>,
     /// Shared peer registry for flow distribution via consistent hashing.
@@ -2169,6 +2258,15 @@ impl FlowBuilder {
         self
     }
 
+    /// Sets the registry of flows callable in-process.
+    pub fn inproc(
+        mut self,
+        inproc: Arc<flowgen_core::task::inproc::registry::InprocRegistry>,
+    ) -> Self {
+        self.inproc = Some(inproc);
+        self
+    }
+
     /// Sets this pod's holder identity, shared across every flow's Executor.
     pub fn holder_identity(mut self, holder_identity: String) -> Self {
         self.holder_identity = Some(holder_identity);
@@ -2205,6 +2303,10 @@ impl FlowBuilder {
             client_registry: match self.client_registry {
                 Some(registry) => registry,
                 None => Arc::new(flowgen_core::client_registry::ClientRegistry::new()),
+            },
+            inproc: match self.inproc {
+                Some(inproc) => inproc,
+                None => Arc::new(flowgen_core::task::inproc::registry::InprocRegistry::new()),
             },
             holder_identity: self.holder_identity,
             peer_registry: self.peer_registry,

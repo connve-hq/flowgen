@@ -30,6 +30,8 @@ pub enum Error {
         #[source]
         source: Box<rhai::EvalAltResult>,
     },
+    #[error("{0}")]
+    Thrown(String),
     #[error("Event conversion error: {source}")]
     EventConversion {
         #[source]
@@ -70,6 +72,16 @@ pub enum Error {
         #[source]
         source: Box<Error>,
     },
+}
+
+/// A string the script throws is its error message as written.
+fn execution_error(source: Box<rhai::EvalAltResult>) -> Error {
+    match source.as_ref() {
+        rhai::EvalAltResult::ErrorRuntime(value, _) if value.is_string() => {
+            Error::Thrown(value.to_string())
+        }
+        _ => Error::ScriptExecution { source },
+    }
 }
 
 /// Handles individual script execution operations.
@@ -191,7 +203,7 @@ impl EventHandler {
             let result: Dynamic = self
                 .engine
                 .eval_with_scope(&mut scope, &self.code)
-                .map_err(|e| Error::ScriptExecution { source: e })?;
+                .map_err(execution_error)?;
 
             // Extract ctx from scope after script execution.
             let ctx_dynamic = scope.get_value::<Dynamic>("ctx");
@@ -452,16 +464,7 @@ impl crate::task::runner::Runner for Processor {
 
         let mut engine = Engine::new();
 
-        // Bound script CPU and memory so a runaway or hostile script
-        // cannot stall the worker. Limits come from the task config and
-        // are individually overridable in flow YAML.
-        let limits = &self.config.limits;
-        engine.set_max_operations(limits.max_operations);
-        engine.set_max_call_levels(limits.max_call_depth);
-        engine.set_max_string_size(limits.max_string_size);
-        engine.set_max_array_size(limits.max_array_size);
-        engine.set_max_map_size(limits.max_map_size);
-        engine.set_max_expr_depths(limits.max_expr_depth, limits.max_function_expr_depth);
+        self.config.limits.apply(&mut engine);
 
         // Route Rhai print() and debug() through tracing so output inherits
         // the current span context (flow, task, task_id, task_type).
@@ -750,6 +753,7 @@ impl crate::task::runner::Runner for Processor {
                                         let is_retriable = !matches!(
                                             &e,
                                             Error::ScriptExecution { .. }
+                                                | Error::Thrown(_)
                                                 | Error::InvalidReturnType(_)
                                                 | Error::ResourceLoad { .. }
                                         );
@@ -766,13 +770,9 @@ impl crate::task::runner::Runner for Processor {
                             .await;
 
                             if let Err(err) = result {
-                                let mut error_event = event.clone();
-                                error_event.error = Some(err.to_string());
-                                if let Some(ref tx) = event_handler.tx {
-                                    tx.send(error_event).await.ok();
-                                } else if let Some(arc) = event.completion_tx.as_ref() {
-                                    arc.signal_completion_with_error(err.to_string());
-                                }
+                                event
+                                    .forward_failure(event_handler.tx.as_ref(), err.to_string())
+                                    .await;
                             }
                         }
                         .instrument(tracing::Span::current()),
@@ -1119,6 +1119,21 @@ mod tests {
         let mut engine = Engine::new();
         register_helpers(&mut engine);
         engine
+    }
+
+    #[test]
+    fn a_thrown_string_is_the_error_message() {
+        let engine = Engine::new();
+        let thrown = engine
+            .eval::<rhai::Dynamic>(r#"throw "Push rejected""#)
+            .unwrap_err();
+        assert_eq!(execution_error(thrown).to_string(), "Push rejected");
+
+        let failed = engine.eval::<rhai::Dynamic>("missing()").unwrap_err();
+        assert!(matches!(
+            execution_error(failed),
+            Error::ScriptExecution { .. }
+        ));
     }
 
     #[test]

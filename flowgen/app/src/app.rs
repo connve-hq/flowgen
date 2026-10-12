@@ -233,6 +233,18 @@ pub enum Error {
         #[source]
         source: crate::login::LoginError,
     },
+    /// A machine key is too short to be accepted.
+    #[error(
+        "Machine key '{name}' in web.api_credentials_path is shorter than {} characters and is ignored",
+        crate::web::MIN_API_KEY_LEN
+    )]
+    ApiKeyTooShort { name: String },
+    /// The web API's machine keys could not be loaded; none are accepted.
+    #[error("Failed to load web.api_credentials_path, no machine keys are accepted: {source}")]
+    ApiCredentials {
+        #[source]
+        source: flowgen_core::credentials::Error,
+    },
     /// MCP server startup error.
     #[error("Failed to start MCP server: {source}")]
     McpServerStart {
@@ -467,22 +479,7 @@ impl App {
                     source,
                 })?;
 
-            // Determine format from key extension, default to YAML.
-            let file_format = if key.ends_with(".json") {
-                config::FileFormat::Json
-            } else {
-                config::FileFormat::Yaml
-            };
-
-            let config = Config::builder()
-                .add_source(config::File::from_str(&content, file_format))
-                .build()
-                .map_err(|source| Error::CacheFlowConfigParse {
-                    key: key.clone(),
-                    source,
-                })?;
-
-            match config.try_deserialize::<FlowConfigRaw>() {
+            match FlowConfigRaw::parse(&key, &content) {
                 Ok(raw) => {
                     let identity_path = match key
                         .strip_prefix(prefix)
@@ -518,9 +515,11 @@ impl App {
                 }
                 Err(source) => {
                     error!(
-                        key = %key,
-                        error = %source,
-                        "Failed to deserialize flow config from cache, skipping"
+                        "{}. Skipping this flow.",
+                        Error::CacheFlowConfigParse {
+                            key: key.clone(),
+                            source,
+                        }
                     );
                 }
             }
@@ -983,6 +982,7 @@ impl App {
         // Created once at the worker level and shared across all flows so tasks with
         // identical credentials (e.g. same Salesforce org) reuse the same client.
         let client_registry = Arc::new(flowgen_core::client_registry::ClientRegistry::new());
+        let inproc = Arc::new(flowgen_core::task::inproc::registry::InprocRegistry::new());
 
         // Leases and peer keys go to the system bucket, out of reach of
         // `ctx.cache`. It is absent only when the cache is disabled, which
@@ -1079,6 +1079,7 @@ impl App {
                 .cache(Arc::clone(&cache))
                 .system_cache(Arc::clone(&executor_cache))
                 .client_registry(Arc::clone(&client_registry))
+                .inproc(Arc::clone(&inproc))
                 .holder_identity(holder_identity.clone())
                 .peer_registry(Arc::clone(&peer_registry));
 
@@ -1333,6 +1334,7 @@ impl App {
         if let Some(web_config) = web_config.filter(|w| w.enabled) {
             let port = web_config.port;
             let path = web_config.path.clone();
+            warn_about_authoring(web_config, system.cache.is_some());
 
             let auth_setup = match &web_config.auth {
                 Some(login_config) => {
@@ -1342,6 +1344,10 @@ impl App {
             };
 
             if let Some((login_client, cookie_key)) = auth_setup {
+                let api_keys = match &web_config.api_credentials_path {
+                    Some(path) => load_api_keys(path).await,
+                    None => Vec::new(),
+                };
                 let web_state = crate::web::WebState {
                     flow_registry: Arc::clone(&flow_registry),
                     prefix: String::new(),
@@ -1354,10 +1360,25 @@ impl App {
                     app_config: Arc::clone(&app_config),
                     conversation_cache: Arc::clone(&executor_cache),
                     system_bucket_present: system.cache.is_some(),
-                    conversation_history_ttl: web_config.agents.conversation_history_ttl,
+                    agents: match &web_config.agents {
+                        Some(agents) if agents.enabled => Some(agents.clone()),
+                        _ => None,
+                    },
                     login_client,
                     cookie_key,
                     cookie_secure: web_config.cookie_secure,
+                    api_keys,
+                    authoring: match &web_config.authoring {
+                        Some(authoring) if authoring.enabled => Some(authoring.clone()),
+                        _ => None,
+                    },
+                    inproc: Arc::clone(&inproc),
+                    flows_cache: match &flow_cache {
+                        Some((cache, _)) => {
+                            Some(Arc::clone(cache) as Arc<dyn flowgen_core::cache::Cache>)
+                        }
+                        None => None,
+                    },
                 };
                 let web_handle = tokio::spawn(async move {
                     if let Err(source) = crate::web::start_web_server(port, &path, web_state).await
@@ -1391,6 +1412,12 @@ impl App {
 
         // Spawn the hot-reload watcher and reconciler if the system cache supports watching.
         // The watcher subscribes to flow key changes and the reconciler applies them.
+        let servers = crate::reconciler::FlowServers {
+            http_server: http_server.clone(),
+            mcp_server: mcp_server.clone(),
+            ai_gateway_server: ai_gateway_server.clone(),
+            inproc: Arc::clone(&inproc),
+        };
         let watcher_shutdown = tokio_util::sync::CancellationToken::new();
         let runtime_cache = Arc::clone(&cache);
         // Only cache-backed flows have keys to watch.
@@ -1413,9 +1440,7 @@ impl App {
                 runtime_cache: Arc::clone(&runtime_cache),
                 app_config: Arc::clone(&app_config),
                 resource_loader: resource_loader.clone(),
-                http_server: http_server.clone(),
-                mcp_server: mcp_server.clone(),
-                ai_gateway_server: ai_gateway_server.clone(),
+                servers: servers.clone(),
                 filesystem_flow_paths: Arc::new(filesystem_flow_paths.clone()),
                 flow_registry: Arc::clone(&flow_registry),
                 client_registry: Arc::clone(&client_registry),
@@ -1438,27 +1463,16 @@ impl App {
         // while flows are being shut down.
         watcher_shutdown.cancel();
 
-        // Cancel all running flows via their cancellation tokens, then abort server
-        // handles (HTTP, MCP) which do not use tokens.
-        if let Ok(registry) = flow_registry.read() {
-            for handle in registry.values() {
-                handle.cancellation_token.cancel();
-            }
-        }
         for handle in &background_handles {
             handle.abort();
         }
-
-        // Await all server background tasks and all flow join handles.
         let _ = futures::future::join_all(background_handles).await;
-        let flow_join_handles: Vec<tokio::task::JoinHandle<()>> = match flow_registry.write() {
-            Ok(mut registry) => registry
-                .drain()
-                .map(|(_, handle)| handle.join_handle)
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let _ = futures::future::join_all(flow_join_handles).await;
+        stop_flows(
+            &flow_registry,
+            &servers,
+            crate::reconciler::FLOW_STOP_TIMEOUT,
+        )
+        .await;
 
         // All flows have now fully stopped. Clean up leases to allow new pods to acquire leadership.
         // At this point it is safe to delete leases because no flows are processing events.
@@ -1476,6 +1490,74 @@ impl App {
 
         info!("Shutdown complete, all flows stopped and leases released");
         Ok(())
+    }
+}
+
+/// Warns about authoring settings that are accepted but do not protect what they appear to.
+fn warn_about_authoring(web_config: &crate::config::WebOptions, system_bucket_present: bool) {
+    let authoring = match &web_config.authoring {
+        Some(authoring) if authoring.enabled => authoring,
+        _ => return,
+    };
+    let has_approver_groups = authoring
+        .targets
+        .iter()
+        .any(|target| !target.approver_groups.is_empty());
+    if web_config.auth.is_none() && has_approver_groups {
+        warn!("web.authoring.targets set approver_groups, but they are not enforced without web.auth: anyone who can reach the web UI can approve a change");
+    }
+    if !system_bucket_present {
+        warn!("web.authoring is enabled without a system bucket, so proposed changes are kept in the runtime cache that flow scripts can read and write");
+    }
+}
+
+/// Machine keys for the web API from the file at `path`, none when it cannot be read.
+async fn load_api_keys(path: &std::path::Path) -> Vec<flowgen_core::credentials::ApiKey> {
+    use secrecy::ExposeSecret;
+
+    match flowgen_core::credentials::load_api_credentials(path).await {
+        Ok(credentials) => {
+            for key in &credentials.api_keys {
+                if key.key.expose_secret().len() < crate::web::MIN_API_KEY_LEN {
+                    error!(
+                        "{}",
+                        Error::ApiKeyTooShort {
+                            name: key.name.clone()
+                        }
+                    );
+                }
+            }
+            credentials.api_keys
+        }
+        Err(source) => {
+            error!("{}", Error::ApiCredentials { source });
+            Vec::new()
+        }
+    }
+}
+
+/// Cancels every registered flow, deregisters it from the shared servers so its
+/// tasks see their input close, and waits up to `timeout` for all of them to stop.
+async fn stop_flows(
+    flow_registry: &RwLock<HashMap<String, FlowHandle>>,
+    servers: &crate::reconciler::FlowServers,
+    timeout: std::time::Duration,
+) {
+    let handles: Vec<(String, FlowHandle)> = match flow_registry.write() {
+        Ok(mut registry) => registry.drain().collect(),
+        Err(poisoned) => poisoned.into_inner().drain().collect(),
+    };
+    let mut join_handles = Vec::with_capacity(handles.len());
+    for (flow, handle) in handles {
+        handle.cancellation_token.cancel();
+        servers.deregister_flow(&flow);
+        join_handles.push(handle.join_handle);
+    }
+    if tokio::time::timeout(timeout, futures::future::join_all(join_handles))
+        .await
+        .is_err()
+    {
+        warn!(timeout = ?timeout, "Not every flow stopped in time, shutting down anyway");
     }
 }
 
@@ -1513,26 +1595,55 @@ fn cluster_port(app_config: &AppConfig) -> Option<u16> {
     }
 }
 
-/// `$POD_IP:port`, the address peers use to reach this pod.
+/// Addresses probed for the default route: TEST-NET-1 and the IPv6 documentation prefix.
+const DEFAULT_ROUTE_PROBES: [(&str, &str); 2] =
+    [("0.0.0.0:0", "192.0.2.1:9"), ("[::]:0", "[2001:db8::1]:9")];
+
+/// `ip:port` the peers use to reach this pod: `$POD_IP`, else the default route's source address.
 fn cluster_peer_address(port: u16) -> Option<String> {
-    let raw = match std::env::var("POD_IP") {
-        Ok(raw) => raw,
-        Err(_) => {
-            debug!("POD_IP is not set, so other pods cannot read this pod's logs and counters");
-            return None;
-        }
+    let ip = match std::env::var("POD_IP") {
+        Ok(raw) => match raw.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    pod_ip = %raw,
+                    error = %e,
+                    "POD_IP is not an IP address, so other pods cannot read this pod's logs and counters"
+                );
+                return None;
+            }
+        },
+        Err(_) => match default_route_ip() {
+            Some(ip) => {
+                info!(address = %ip, "POD_IP is not set, advertising the default route address to other pods");
+                ip
+            }
+            None => {
+                debug!("POD_IP is not set and there is no default route, so other pods cannot read this pod's logs and counters");
+                return None;
+            }
+        },
     };
-    match raw.parse::<std::net::IpAddr>() {
-        Ok(ip) => Some(std::net::SocketAddr::new(ip, port).to_string()),
-        Err(e) => {
-            warn!(
-                pod_ip = %raw,
-                error = %e,
-                "POD_IP is not an IP address, so other pods cannot read this pod's logs and counters"
-            );
-            None
+    Some(std::net::SocketAddr::new(ip, port).to_string())
+}
+
+/// Source address of the interface that holds the default route.
+fn default_route_ip() -> Option<std::net::IpAddr> {
+    for (bind, target) in DEFAULT_ROUTE_PROBES {
+        match route_source(bind, target) {
+            Ok(ip) if !ip.is_unspecified() && !ip.is_loopback() => return Some(ip),
+            Ok(_) => {}
+            Err(e) => debug!(probe = %target, error = %e, "Default route probe failed"),
         }
     }
+    None
+}
+
+/// Local address the kernel picks for `target`; connecting a UDP socket sends nothing.
+fn route_source(bind: &str, target: &str) -> std::io::Result<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(bind)?;
+    socket.connect(target)?;
+    Ok(socket.local_addr()?.ip())
 }
 
 /// Builds the web UI's login client and cookie key from `web.auth`.
@@ -1617,6 +1728,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn route_source_returns_the_interface_address_for_the_target() {
+        let ip = route_source("127.0.0.1:0", "127.0.0.1:9").unwrap();
+        assert_eq!(ip, std::net::IpAddr::from([127, 0, 0, 1]));
+    }
+
     fn flow_from_yaml(identity: &str, yaml: &str) -> super::super::flow::Flow {
         let raw: FlowConfigRaw = Config::builder()
             .add_source(config::File::from_str(yaml, config::FileFormat::Yaml))
@@ -1655,6 +1772,38 @@ mod tests {
             from_filesystem: true,
             task_manager,
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_flows_releases_the_senders_the_servers_hold() {
+        let servers = crate::reconciler::FlowServers::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<flowgen_core::event::Event>(1);
+        servers.inproc.register(
+            "a/b".to_string(),
+            flowgen_core::task::inproc::registry::Registration {
+                tx,
+                task_name: "on_call".to_string(),
+                task_id: 0,
+                task_type: "inproc_endpoint",
+                leaf_count: 1,
+                ack_timeout: None,
+                callers: Vec::new(),
+            },
+        );
+        let join_handle = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let flow_registry = RwLock::new(HashMap::from([(
+            "a/b".to_string(),
+            flow_handle("a/b", false, join_handle, None),
+        )]));
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_flows(&flow_registry, &servers, std::time::Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(stopped.is_ok());
+        assert!(flow_registry.read().unwrap().is_empty());
     }
 
     #[tokio::test]

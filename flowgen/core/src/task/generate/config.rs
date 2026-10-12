@@ -32,6 +32,7 @@ pub const MAX_INTERVAL: Duration = Duration::from_secs(3_155_760_000);
 
 /// Configuration for generate subscriber tasks that produce scheduled events.
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, Hash, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Subscriber {
     /// The unique name / identifier of the task.
     pub name: String,
@@ -40,7 +41,8 @@ pub struct Subscriber {
     /// any other JSON value is sent as-is without `system_info`.
     pub payload: Option<serde_json::Value>,
     /// Interval - waits one interval after startup, then repeats every duration.
-    /// After a restart, the first run is scheduled from the last successful run.
+    /// After a restart, the next run is due one interval after the last attempt,
+    /// or after the first start when there was none.
     /// Accepts duration strings: "100ms", "30s", "5m", etc.
     /// Mutually exclusive with `cron`.
     #[serde(default, with = "humantime_serde")]

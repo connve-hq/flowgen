@@ -102,9 +102,8 @@ pub struct WebState {
     /// runtime cache that flow scripts can reach — `start_web_server` warns
     /// once at startup so operators know.
     pub system_bucket_present: bool,
-    /// TTL applied to each conversation write, refreshed on every save. `None`
-    /// persists indefinitely. From `web.agents.conversation_history_ttl`.
-    pub conversation_history_ttl: Option<Duration>,
+    /// From `web.agents`; `None` disables `/api/agents`.
+    pub agents: Option<crate::config::AgentsOptions>,
     /// OIDC login client, built from `web.auth` at startup. `None` leaves
     /// the web UI unauthenticated.
     pub login_client: Option<Arc<crate::login::LoginClient>>,
@@ -116,6 +115,95 @@ pub struct WebState {
     /// Whether login cookies carry `Secure` (browsers require HTTPS to send
     /// them). From `web.cookie_secure`, default `true`.
     pub cookie_secure: bool,
+    /// Machine keys `/api/*` accepts as `Authorization: Bearer`, from
+    /// `web.api_credentials_path`.
+    pub api_keys: Vec<flowgen_core::credentials::ApiKey>,
+    /// From `web.authoring`; `None` disables `/api/changes`.
+    pub authoring: Option<crate::config::AuthoringOptions>,
+    /// Flows callable in-process; approved changes are published through one.
+    pub inproc: Arc<flowgen_core::task::inproc::registry::InprocRegistry>,
+    /// Bucket the synced flow sources are read from, when flows load from the
+    /// cache (`flows.cache`).
+    pub flows_cache: Option<Arc<dyn flowgen_core::cache::Cache>>,
+}
+
+/// Who an `/api/*` request authenticated as, when `web.auth` is set.
+#[derive(Clone, Debug)]
+pub(crate) enum Caller {
+    /// A signed-in user, through the session cookie.
+    User(flowgen_core::auth::UserContext),
+    /// A machine key from `web.api_credentials_path`, by name.
+    Key(String),
+}
+
+impl Caller {
+    /// How the caller appears in audit fields: a user by their email claim, as
+    /// the user id is often opaque, and a machine key as `key:<name>`.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Caller::User(user) => match user.claims.get("email") {
+                Some(serde_json::Value::String(email)) if !email.trim().is_empty() => {
+                    email.trim().to_string()
+                }
+                _ => user.user_id.clone(),
+            },
+            Caller::Key(name) => format!("key:{name}"),
+        }
+    }
+}
+
+/// Shortest machine key `/api/*` accepts; shorter keys in the file are ignored.
+pub(crate) const MIN_API_KEY_LEN: usize = 32;
+
+/// Routes a machine key may call: reading flows, resources, logs and changes,
+/// validating files, and proposing and editing changes; the authoring handlers
+/// let a key edit only the changes it proposed.
+fn key_may_call(api_prefix: &str, method: &axum::http::Method, path: &str) -> bool {
+    let route = match path.strip_prefix(api_prefix) {
+        Some(route) => route,
+        None => return false,
+    };
+    let under = |base: &str| route == base || route.starts_with(&format!("{base}/"));
+    let change = route.strip_prefix("/changes/");
+    let single = |id: &str| !id.is_empty() && !id.contains('/');
+    match *method {
+        axum::http::Method::GET => [
+            "/flows",
+            "/resources",
+            "/logs",
+            "/changes",
+            "/version",
+            "/workspace/file",
+        ]
+        .iter()
+        .any(|base| under(base)),
+        axum::http::Method::POST => {
+            route == "/changes"
+                || route == "/workspace/validate"
+                || matches!(change.and_then(|rest| rest.strip_suffix("/files")), Some(id) if single(id))
+        }
+        axum::http::Method::PATCH => matches!(change, Some(id) if single(id)),
+        _ => false,
+    }
+}
+
+/// The machine key whose value is the request's bearer token, compared in
+/// constant time.
+fn matching_key<'a>(
+    keys: &'a [flowgen_core::credentials::ApiKey],
+    headers: &axum::http::HeaderMap,
+) -> Option<&'a flowgen_core::credentials::ApiKey> {
+    use secrecy::ExposeSecret;
+    use subtle::ConstantTimeEq;
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = flowgen_core::auth::extract_bearer_token(header)?;
+    keys.iter().find(|key| {
+        let key = key.key.expose_secret().as_bytes();
+        key.len() >= MIN_API_KEY_LEN && bool::from(key.ct_eq(token.as_bytes()))
+    })
 }
 
 /// Wraps `cookie::Key` so `FromRef<Arc<WebState>>` can be implemented here
@@ -151,7 +239,8 @@ pub async fn start_web_server(port: u16, path: &str, state: WebState) -> Result<
     // runtime cache that flow scripts can read and write via `ctx.cache`. Warn
     // once at startup so operators know to configure a system bucket when that
     // access matters.
-    let system_bucket_present = state.system_bucket_present;
+    let warn_conversations_in_runtime_cache =
+        state.agents.is_some() && !state.system_bucket_present;
 
     let app = router(path, state);
 
@@ -161,7 +250,7 @@ pub async fn start_web_server(port: u16, path: &str, state: WebState) -> Result<
 
     info!(port, path = %path, "Starting web server");
 
-    if !system_bucket_present {
+    if warn_conversations_in_runtime_cache {
         warn!(
             "Agents conversation history is stored in the runtime cache (no system cache bucket \
              configured), which flow scripts can read and write via ctx.cache"
@@ -191,6 +280,24 @@ fn router(path: &str, mut state: WebState) -> Router {
         .route(&format!("{auth_prefix}/me"), get(auth_me))
         .with_state(Arc::clone(&state));
 
+    let agents = Router::new()
+        .route(&format!("{api_prefix}/agents/chat"), post(proxy_chat))
+        .route(&format!("{api_prefix}/agents/models"), get(proxy_models))
+        .route(
+            &format!("{api_prefix}/agents/conversations"),
+            get(list_conversations),
+        )
+        .route(
+            &format!("{api_prefix}/agents/conversations/{{id}}"),
+            get(get_conversation)
+                .put(put_conversation)
+                .delete(delete_conversation),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_agents,
+        ));
+
     let mut api = Router::new()
         .route(&format!("{api_prefix}/flows"), get(list_flows))
         .route(&format!("{api_prefix}/flows/stream"), get(stream_flows))
@@ -204,17 +311,34 @@ fn router(path: &str, mut state: WebState) -> Router {
         )
         .route(&format!("{api_prefix}/version"), get(get_version))
         .route(&format!("{api_prefix}/config"), get(get_config))
-        .route(&format!("{api_prefix}/agents/chat"), post(proxy_chat))
-        .route(&format!("{api_prefix}/agents/models"), get(proxy_models))
+        .merge(agents)
         .route(
-            &format!("{api_prefix}/agents/conversations"),
-            get(list_conversations),
+            &format!("{api_prefix}/workspace/validate"),
+            post(crate::authoring::validate_workspace),
         )
         .route(
-            &format!("{api_prefix}/agents/conversations/{{id}}"),
-            get(get_conversation)
-                .put(put_conversation)
-                .delete(delete_conversation),
+            &format!("{api_prefix}/workspace/file"),
+            get(crate::authoring::workspace_file),
+        )
+        .route(
+            &format!("{api_prefix}/changes"),
+            get(crate::authoring::list_changes).post(crate::authoring::propose_change),
+        )
+        .route(
+            &format!("{api_prefix}/changes/{{id}}"),
+            get(crate::authoring::get_change).patch(crate::authoring::edit_change),
+        )
+        .route(
+            &format!("{api_prefix}/changes/{{id}}/files"),
+            post(crate::authoring::add_change_files),
+        )
+        .route(
+            &format!("{api_prefix}/changes/{{id}}/approve"),
+            post(crate::authoring::approve_change),
+        )
+        .route(
+            &format!("{api_prefix}/changes/{{id}}/reject"),
+            post(crate::authoring::reject_change),
         )
         .route(&format!("{api_prefix}/openapi.yaml"), get(get_openapi))
         .route(&format!("{api_prefix}/resources"), get(list_resources))
@@ -296,13 +420,70 @@ fn removal_cookie(
     cookie
 }
 
-/// `GET /auth/login` — redirects the browser to the IdP.
-async fn auth_login(State(state): State<Arc<WebState>>, jar: AuthJar) -> impl IntoResponse {
+/// What's encrypted into `SSO_STATE_COOKIE` between `/auth/login` and `/auth/callback`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingLogin {
+    #[serde(flatten)]
+    login: crate::login::LoginState,
+    /// Where the callback sends the browser, already checked by [`return_path`].
+    #[serde(default)]
+    return_to: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AuthLoginQuery {
+    /// Web UI page to come back to after signing in; dropped unless it is a
+    /// page under the UI's path outside the auth routes.
+    return_to: Option<String>,
+}
+
+/// `return_to` when it is a web UI page on this origin, outside the auth routes.
+fn return_path(prefix: &str, return_to: &str) -> Option<String> {
+    let path = return_to.strip_prefix(prefix)?;
+    let safe = path.starts_with('/')
+        && !return_to.starts_with("//")
+        && return_to.chars().all(|c| c.is_ascii_graphic() && c != '\\')
+        && !has_dot_segment(path)
+        && !path.starts_with("/auth/");
+    match safe {
+        true => Some(return_to.to_string()),
+        false => None,
+    }
+}
+
+/// Whether the path part holds a `.` or `..` segment, plain or percent-encoded,
+/// which a browser resolves before following the redirect.
+fn has_dot_segment(path_and_query: &str) -> bool {
+    let path = match path_and_query.split_once(['?', '#']) {
+        Some((path, _)) => path,
+        None => path_and_query,
+    };
+    path.split('/').any(|segment| {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        decoded == "." || decoded == ".."
+    })
+}
+
+/// `GET /auth/login` — redirects the browser to the IdP. `return_to` names
+/// the page to come back to after the callback.
+async fn auth_login(
+    State(state): State<Arc<WebState>>,
+    jar: AuthJar,
+    axum::extract::Query(query): axum::extract::Query<AuthLoginQuery>,
+) -> impl IntoResponse {
     let Some(login_client) = &state.login_client else {
         return (StatusCode::NOT_FOUND, "OIDC login is not configured").into_response();
     };
     let (url, login_state) = login_client.authorize_url();
-    let Ok(encoded) = serde_json::to_string(&login_state) else {
+    let return_to = match query.return_to {
+        Some(return_to) => return_path(&state.prefix, &return_to),
+        None => None,
+    };
+    let pending = PendingLogin {
+        login: login_state,
+        return_to,
+    };
+    let Ok(encoded) = serde_json::to_string(&pending) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to start login").into_response();
     };
     let jar = jar.add(auth_cookie(
@@ -319,6 +500,16 @@ struct AuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    error_description: Option<String>,
+}
+
+/// Sends the browser to the web UI login page with why signing in failed:
+/// `access_denied` when the provider refused the user, `provider` for another
+/// provider error, `expired` when the sign-in outlived its state cookie, and
+/// `failed` when the response could not be verified. Only these codes, so a
+/// crafted link cannot put text on the page.
+fn login_failed(state: &WebState, code: &'static str) -> axum::response::Response {
+    Redirect::to(&format!("{}login?error={code}", ui_url(&state.prefix))).into_response()
 }
 
 /// `GET /auth/callback` — exchanges the code, verifies everything, and sets
@@ -333,32 +524,37 @@ async fn auth_callback(
     };
 
     if let Some(error) = query.error {
-        warn!(error = %error, "OIDC provider returned an error at callback");
-        return (
-            StatusCode::BAD_REQUEST,
-            "Login failed at the identity provider",
-        )
-            .into_response();
+        let description = match &query.error_description {
+            Some(description) => description.as_str(),
+            None => "",
+        };
+        warn!(error = %error, description = %description, "OIDC provider returned an error at callback");
+        return match error.as_str() {
+            "access_denied" => login_failed(&state, "access_denied"),
+            _ => login_failed(&state, "provider"),
+        };
     }
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
-        return (StatusCode::BAD_REQUEST, "Missing code or state").into_response();
+        warn!("OIDC callback has no code or state");
+        return login_failed(&state, "failed");
     };
 
-    let Some(stashed_raw) = jar.get(SSO_STATE_COOKIE) else {
-        return (StatusCode::BAD_REQUEST, "Login session expired, try again").into_response();
+    let stashed = match jar.get(SSO_STATE_COOKIE) {
+        Some(stashed) => serde_json::from_str::<PendingLogin>(stashed.value()).ok(),
+        None => None,
     };
-    let Ok(stashed) = serde_json::from_str::<crate::login::LoginState>(stashed_raw.value()) else {
-        return (StatusCode::BAD_REQUEST, "Corrupt login session, try again").into_response();
+    let Some(stashed) = stashed else {
+        return login_failed(&state, "expired");
     };
 
     let result = match login_client
-        .exchange_code(code, &returned_state, &stashed)
+        .exchange_code(code, &returned_state, &stashed.login)
         .await
     {
         Ok(result) => result,
         Err(source) => {
             warn!(error = %source, "OIDC login failed");
-            return (StatusCode::UNAUTHORIZED, "Login failed").into_response();
+            return login_failed(&state, "failed");
         }
     };
 
@@ -386,7 +582,11 @@ async fn auth_callback(
             None,
             state.cookie_secure,
         ));
-    (jar, Redirect::to(&ui_url(&state.prefix))).into_response()
+    let redirect_to = match stashed.return_to {
+        Some(return_to) => return_to,
+        None => ui_url(&state.prefix),
+    };
+    (jar, Redirect::to(&redirect_to)).into_response()
 }
 
 /// Where the web UI lives, for redirecting back to it.
@@ -547,7 +747,8 @@ fn apply_refreshed_cookies(response: &mut axum::response::Response, jar: AuthJar
 }
 
 /// Protects `/api/*` when `web.auth` is configured, on the session
-/// [`resolve_session`] resolves. Not layered at all when `web.auth` is unset.
+/// [`resolve_session`] resolves or else a machine key. Not layered at all
+/// when `web.auth` is unset.
 async fn auth_middleware(
     State(state): State<Arc<WebState>>,
     jar: AuthJar,
@@ -559,16 +760,33 @@ async fn auth_middleware(
     }
     match resolve_session(&state, &jar).await {
         Some(resolved) => {
-            request
-                .extensions_mut()
-                .insert(resolved.session.user.clone());
+            let user = resolved.session.user.clone();
+            request.extensions_mut().insert(Caller::User(user.clone()));
+            request.extensions_mut().insert(user);
             let mut response = next.run(request).await;
             if let Some(jar) = resolved.refreshed {
                 apply_refreshed_cookies(&mut response, jar);
             }
             response
         }
-        None => StatusCode::UNAUTHORIZED.into_response(),
+        None => match matching_key(&state.api_keys, request.headers()) {
+            Some(_)
+                if !key_may_call(
+                    &format!("{}/api", state.prefix),
+                    request.method(),
+                    request.uri().path(),
+                ) =>
+            {
+                StatusCode::FORBIDDEN.into_response()
+            }
+            Some(key) => {
+                request
+                    .extensions_mut()
+                    .insert(Caller::Key(key.name.clone()));
+                next.run(request).await
+            }
+            None => StatusCode::UNAUTHORIZED.into_response(),
+        },
     }
 }
 
@@ -1049,10 +1267,37 @@ async fn get_config(State(state): State<Arc<WebState>>) -> Json<api::ConfigInfo>
             String::new()
         }
     };
-    Json(api::ConfigInfo { yaml })
+    let authoring_targets = match &state.authoring {
+        Some(authoring) => authoring
+            .targets
+            .iter()
+            .map(|target| api::AuthoringTarget {
+                name: target.name.clone(),
+                paths: target.paths.clone(),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    Json(api::ConfigInfo {
+        yaml,
+        agents: state.agents.is_some(),
+        authoring: state.authoring.is_some(),
+        authoring_targets,
+    })
 }
 
-/// Header and value identifying the built-in Agents chat to the AI gateway.
+/// Answers `/api/agents` with 404 unless `web.agents` is enabled.
+async fn require_agents(
+    State(state): State<Arc<WebState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match state.agents {
+        Some(_) => next.run(request).await,
+        None => (StatusCode::NOT_FOUND, "Agents are not enabled (web.agents)").into_response(),
+    }
+}
+
 /// Resolves the base URL the built-in Agents chat proxies to. Prefers the
 /// explicit `web.ai_gateway_url`; otherwise targets the same-process AI
 /// gateway on loopback. Returns `None` when no gateway is configured.
@@ -1303,10 +1548,13 @@ async fn put_conversation(
         }
     };
 
-    let ttl_secs = state.conversation_history_ttl.and_then(|d| {
-        let secs = d.as_secs();
-        (secs > 0).then_some(secs)
-    });
+    let ttl_secs = match &state.agents {
+        Some(crate::config::AgentsOptions {
+            conversation_history_ttl: Some(ttl),
+            ..
+        }) if ttl.as_secs() > 0 => Some(ttl.as_secs()),
+        _ => None,
+    };
     match state
         .conversation_cache
         .put(&conversation_key(&id), bytes.into(), ttl_secs)
@@ -1470,10 +1718,14 @@ mod tests {
             app_config,
             conversation_cache: Arc::new(flowgen_core::cache::memory::MemoryCache::new()),
             system_bucket_present: false,
-            conversation_history_ttl: None,
+            agents: None,
             login_client: None,
             cookie_key: axum_extra::extract::cookie::Key::generate(),
             cookie_secure: true,
+            api_keys: Vec::new(),
+            authoring: None,
+            inproc: Arc::new(flowgen_core::task::inproc::registry::InprocRegistry::new()),
+            flows_cache: None,
         }
     }
 
@@ -1609,6 +1861,653 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sign_in_failures_redirect_to_the_login_page() {
+        let login_client = crate::login::LoginClient::new(
+            crate::login::LoginConfig {
+                issuer_url: issuer().await,
+                client_id: "flowgen".to_string(),
+                client_secret: None,
+                credentials_path: None,
+                redirect_uri: "http://localhost/flowgen/auth/callback".to_string(),
+                extra_scopes: Vec::new(),
+                signout_redirect_url: None,
+            },
+            &secrecy::SecretString::from("client-secret"),
+        )
+        .await
+        .unwrap();
+        let mut state = test_state();
+        state.login_client = Some(Arc::new(login_client));
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let landing = |response: reqwest::Response| {
+            assert!(response.status().is_redirection(), "{}", response.status());
+            response.headers()[reqwest::header::LOCATION]
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        let callback = |query: &str| client.get(format!("{base}/flowgen/auth/callback{query}"));
+
+        for (query, code) in [
+            (
+                "?error=access_denied&error_description=User+is+not+assigned",
+                "access_denied",
+            ),
+            ("?error=server_error", "provider"),
+            ("?error=%3Cb%3Ehi%3C%2Fb%3E", "provider"),
+            ("", "failed"),
+            ("?code=a&state=b", "expired"),
+        ] {
+            let location = landing(callback(query).send().await.unwrap());
+            assert_eq!(location, format!("/flowgen/login?error={code}"), "{query}");
+        }
+
+        let started = client
+            .get(format!("{base}/flowgen/auth/login"))
+            .send()
+            .await
+            .unwrap();
+        let state_cookie = started
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|cookie| cookie.to_str().ok())
+            .find(|cookie| cookie.starts_with(SSO_STATE_COOKIE))
+            .and_then(|cookie| cookie.split(';').next())
+            .unwrap()
+            .to_string();
+        let forged = callback("?code=a&state=forged")
+            .header(reqwest::header::COOKIE, state_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(landing(forged), "/flowgen/login?error=failed");
+    }
+
+    const MACHINE_KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn callers_are_labelled_by_email_then_user_id_and_keys_by_name() {
+        let user = |claims: &[(&str, serde_json::Value)]| {
+            Caller::User(flowgen_core::auth::UserContext {
+                user_id: "00u1".to_string(),
+                claims: claims
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.clone()))
+                    .collect(),
+            })
+        };
+        assert_eq!(
+            user(&[("email", serde_json::json!("jane@example.com"))]).label(),
+            "jane@example.com"
+        );
+        assert_eq!(user(&[("email", serde_json::json!(" "))]).label(), "00u1");
+        assert_eq!(user(&[]).label(), "00u1");
+        assert_eq!(Caller::Key("agent".to_string()).label(), "key:agent");
+    }
+
+    #[test]
+    fn machine_keys_reach_only_the_reading_and_proposing_routes() {
+        use axum::http::Method;
+        let allowed = [
+            (Method::GET, "/f/api/flows"),
+            (Method::GET, "/f/api/flows/a/b"),
+            (Method::GET, "/f/api/changes/abc"),
+            (Method::GET, "/f/api/workspace/file"),
+            (Method::POST, "/f/api/changes"),
+            (Method::POST, "/f/api/changes/abc/files"),
+            (Method::PATCH, "/f/api/changes/abc"),
+            (Method::POST, "/f/api/workspace/validate"),
+        ];
+        let refused = [
+            (Method::POST, "/f/api/changes/abc/approve"),
+            (Method::POST, "/f/api/changes//files"),
+            (Method::PATCH, "/f/api/changes/abc/approve"),
+            (Method::PATCH, "/f/api/flows/a"),
+            (Method::POST, "/f/api/cluster/token"),
+            (Method::GET, "/f/api/agents/conversations"),
+            (Method::GET, "/f/api/config"),
+            (Method::GET, "/f/api/flowsx"),
+        ];
+        for (method, path) in allowed {
+            assert!(key_may_call("/f/api", &method, path), "{method} {path}");
+        }
+        for (method, path) in refused {
+            assert!(!key_may_call("/f/api", &method, path), "{method} {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_machine_key_can_propose_a_change_but_not_approve_it() {
+        let login_client = crate::login::LoginClient::new(
+            crate::login::LoginConfig {
+                issuer_url: issuer().await,
+                client_id: "flowgen".to_string(),
+                client_secret: None,
+                credentials_path: None,
+                redirect_uri: "http://localhost/flowgen/auth/callback".to_string(),
+                extra_scopes: Vec::new(),
+                signout_redirect_url: None,
+            },
+            &secrecy::SecretString::from("client-secret"),
+        )
+        .await
+        .unwrap();
+        let mut state = test_state();
+        state.login_client = Some(Arc::new(login_client));
+        state.api_keys = vec![
+            flowgen_core::credentials::ApiKey {
+                name: "agent".to_string(),
+                key: secrecy::SecretString::from(MACHINE_KEY),
+            },
+            flowgen_core::credentials::ApiKey {
+                name: "blank".to_string(),
+                key: secrecy::SecretString::from(""),
+            },
+        ];
+        state.authoring = Some(crate::config::AuthoringOptions {
+            enabled: true,
+            targets: vec![authoring_target("workspace", &["flows/", "resources/"])],
+            groups_claim: "groups".to_string(),
+        });
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+        let proposal = api::ChangeProposal {
+            title: "Add a".to_string(),
+            description: None,
+            files: vec![api::WorkspaceFile {
+                path: "flows/a.yaml".to_string(),
+                content: Some("flow:\n  tasks:\n    - log:\n        name: a\n".to_string()),
+            }],
+        };
+
+        for wrong in ["other", ""] {
+            let wrong_key = client
+                .post(format!("{base}/flowgen/api/changes"))
+                .header("authorization", format!("Bearer {wrong}"))
+                .json(&proposal)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong_key.status(), 401, "{wrong:?}");
+        }
+
+        let rotate = client
+            .post(format!("{base}/flowgen/api/cluster/token"))
+            .bearer_auth(MACHINE_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rotate.status(), 403);
+
+        let proposed: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .bearer_auth(MACHINE_KEY)
+            .json(&proposal)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(proposed.proposed_by, "key:agent");
+        assert_eq!(proposed.status, api::ChangeStatus::Pending);
+        assert!(proposed.issues.is_empty(), "{:?}", proposed.issues);
+        assert!(proposed.files[0].diff.contains("--- /dev/null"));
+
+        let approve = client
+            .post(format!(
+                "{base}/flowgen/api/changes/{}/approve",
+                proposed.id
+            ))
+            .bearer_auth(MACHINE_KEY)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approve.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn approving_a_change_runs_the_publish_flow_and_records_its_result() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<flowgen_core::event::Event>(1);
+        let inproc = Arc::new(flowgen_core::task::inproc::registry::InprocRegistry::new());
+        inproc.register(
+            "system/publish_workspace".to_string(),
+            flowgen_core::task::inproc::registry::Registration {
+                tx,
+                task_name: "on_publish".to_string(),
+                task_id: 0,
+                task_type: "inproc_endpoint",
+                leaf_count: 1,
+                ack_timeout: None,
+                callers: vec!["system/".to_string()],
+            },
+        );
+        let published = tokio::spawn(async move {
+            let event = rx.recv().await.unwrap();
+            let data = event.data_as_json().unwrap();
+            event
+                .completion_tx
+                .as_ref()
+                .unwrap()
+                .signal_completion(Some(serde_json::json!({"commit": "abc"})));
+            data
+        });
+        let resources = tempfile::TempDir::new().unwrap();
+        let mut state = test_state();
+        state.resource_loader = Some(flowgen_core::resource::ResourceLoader::new(Some(
+            resources.path().to_path_buf(),
+        )));
+        state.authoring = Some(crate::config::AuthoringOptions {
+            enabled: true,
+            targets: vec![authoring_target("workspace", &["flows/", "resources/"])],
+            groups_claim: "groups".to_string(),
+        });
+        state.inproc = inproc;
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+
+        let proposed: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: "Add script".to_string(),
+                description: None,
+                files: vec![api::WorkspaceFile {
+                    path: "resources/s.rhai".to_string(),
+                    content: Some("event".to_string()),
+                }],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let approved: api::Change = client
+            .post(format!(
+                "{base}/flowgen/api/changes/{}/approve",
+                proposed.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(approved.status, api::ChangeStatus::Published);
+        assert_eq!(approved.result["commit"], "abc");
+        let sent = published.await.unwrap();
+        assert_eq!(sent["title"], "Add script");
+        assert_eq!(
+            sent["files"],
+            serde_json::json!([{"path": "resources/s.rhai", "content": "event", "previous": null}])
+        );
+
+        let base_file: api::WorkspaceFile = client
+            .get(format!("{base}/flowgen/api/workspace/file"))
+            .query(&[("path", "resources/s.rhai")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(base_file.content.as_deref(), Some("event"));
+        let follow_up: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: "Edit script".to_string(),
+                description: None,
+                files: vec![api::WorkspaceFile {
+                    path: "resources/s.rhai".to_string(),
+                    content: Some("event; 2".to_string()),
+                }],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(follow_up.files[0].previous.as_deref(), Some("event"));
+
+        let deployment = |content: Option<&str>| {
+            let client = client.clone();
+            let url = format!("{base}/flowgen/api/changes/{}", proposed.id);
+            let file = resources.path().join("s.rhai");
+            let content = content.map(str::to_string);
+            async move {
+                if let Some(content) = content {
+                    std::fs::write(file, content).unwrap();
+                }
+                let change: api::Change =
+                    client.get(url).send().await.unwrap().json().await.unwrap();
+                change.deployment
+            }
+        };
+        assert_eq!(deployment(None).await, Some(api::ChangeDeployment::Waiting));
+        assert_eq!(
+            deployment(Some("event\n")).await,
+            Some(api::ChangeDeployment::Deployed)
+        );
+        assert_eq!(
+            deployment(Some("event; 1")).await,
+            Some(api::ChangeDeployment::Deployed)
+        );
+
+        let again = client
+            .post(format!(
+                "{base}/flowgen/api/changes/{}/approve",
+                proposed.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn a_pending_change_takes_more_files_and_a_new_title_until_it_is_decided() {
+        let mut state = test_state();
+        state.authoring = Some(crate::config::AuthoringOptions {
+            enabled: true,
+            targets: vec![authoring_target("workspace", &["flows/", "resources/"])],
+            groups_claim: "groups".to_string(),
+        });
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+        let file = |path: &str, content: &str| api::WorkspaceFile {
+            path: path.to_string(),
+            content: Some(content.to_string()),
+        };
+        let proposed: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: "Add a".to_string(),
+                description: None,
+                files: vec![file("resources/a.rhai", "1")],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let url = format!("{base}/flowgen/api/changes/{}", proposed.id);
+
+        let added: api::Change = client
+            .post(format!("{url}/files"))
+            .json(&api::WorkspaceFiles {
+                files: vec![file("resources/b.rhai", "2"), file("resources/a.rhai", "3")],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let contents: Vec<_> = added
+            .files
+            .iter()
+            .map(|file| (file.path.as_str(), file.content.as_deref()))
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                ("resources/a.rhai", Some("3")),
+                ("resources/b.rhai", Some("2"))
+            ]
+        );
+        assert!(added.updated_at > proposed.updated_at);
+
+        let edit = |title: &str| {
+            client.patch(&url).json(&api::ChangeEdit {
+                title: Some(title.to_string()),
+                description: Some("Both scripts".to_string()),
+            })
+        };
+        assert_eq!(edit(" ").send().await.unwrap().status(), 400);
+        let edited: api::Change = edit("Add scripts")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(edited.title, "Add scripts");
+        assert_eq!(edited.description.as_deref(), Some("Both scripts"));
+
+        let stale = client
+            .post(format!("{url}/approve"))
+            .query(&[("updatedAt", proposed.updated_at.unwrap())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), 409);
+
+        let rejected = client.post(format!("{url}/reject")).send().await.unwrap();
+        assert_eq!(rejected.status(), 200);
+        assert_eq!(edit("Late").send().await.unwrap().status(), 409);
+    }
+
+    fn authoring_target(name: &str, paths: &[&str]) -> crate::config::AuthoringTarget {
+        crate::config::AuthoringTarget {
+            name: name.to_string(),
+            paths: paths.iter().map(|path| path.to_string()).collect(),
+            publish_flow: "system/publish_workspace".to_string(),
+            approver_groups: Vec::new(),
+            track_deployment: true,
+        }
+    }
+
+    fn authoring_options(
+        targets: Vec<crate::config::AuthoringTarget>,
+    ) -> crate::config::AuthoringOptions {
+        crate::config::AuthoringOptions {
+            enabled: true,
+            targets,
+            groups_claim: "groups".to_string(),
+        }
+    }
+
+    async fn propose(client: &reqwest::Client, base: &str, title: &str, paths: &[&str]) -> u16 {
+        client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: title.to_string(),
+                description: None,
+                files: paths
+                    .iter()
+                    .map(|path| api::WorkspaceFile {
+                        path: path.to_string(),
+                        content: Some("event".to_string()),
+                    })
+                    .collect(),
+            })
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn proposals_with_unsafe_paths_duplicate_files_or_no_title_are_refused() {
+        let mut state = test_state();
+        state.authoring = Some(authoring_options(vec![authoring_target(
+            "workspace",
+            &["flows/", "resources/"],
+        )]));
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            propose(&client, &base, "Add", &["resources/a.rhai"]).await,
+            201
+        );
+        for path in [
+            "resources/a b.rhai",
+            "resources/a:b.rhai",
+            "resources/é.rhai",
+        ] {
+            assert_eq!(propose(&client, &base, "Add", &[path]).await, 400, "{path}");
+        }
+        assert_eq!(
+            propose(
+                &client,
+                &base,
+                "Add",
+                &["resources/a.rhai", "resources/a.rhai"]
+            )
+            .await,
+            400
+        );
+        assert_eq!(
+            propose(&client, &base, " \n", &["resources/a.rhai"]).await,
+            400
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_whose_files_moved_to_another_target_cannot_be_decided() {
+        let mut state = test_state();
+        state.authoring = Some(authoring_options(vec![
+            authoring_target("workspace", &["flows/", "resources/"]),
+            authoring_target("platform", &["flows/platform/"]),
+        ]));
+        let cache = Arc::clone(&state.conversation_cache);
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+        let proposed: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: "Add a".to_string(),
+                description: None,
+                files: vec![api::WorkspaceFile {
+                    path: "flows/platform/a.yaml".to_string(),
+                    content: Some("flow:\n  tasks:\n    - log:\n        name: a\n".to_string()),
+                }],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(proposed.target, "platform");
+        assert!(proposed.issues.is_empty(), "{:?}", proposed.issues);
+        let key = format!("authoring.changes.{}", proposed.id);
+        let mut stored: api::Change =
+            serde_json::from_slice(&cache.get(&key).await.unwrap().unwrap()).unwrap();
+        stored.target = "workspace".to_string();
+        cache
+            .put(&key, serde_json::to_vec(&stored).unwrap().into(), None)
+            .await
+            .unwrap();
+
+        for action in ["approve", "reject"] {
+            let decided = client
+                .post(format!(
+                    "{base}/flowgen/api/changes/{}/{action}",
+                    proposed.id
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(decided.status(), 409, "{action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_rewritten_while_publishing_keeps_the_newer_record() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<flowgen_core::event::Event>(1);
+        let inproc = Arc::new(flowgen_core::task::inproc::registry::InprocRegistry::new());
+        inproc.register(
+            "system/publish_workspace".to_string(),
+            flowgen_core::task::inproc::registry::Registration {
+                tx,
+                task_name: "on_publish".to_string(),
+                task_id: 0,
+                task_type: "inproc_endpoint",
+                leaf_count: 1,
+                ack_timeout: None,
+                callers: vec!["system/".to_string()],
+            },
+        );
+        let mut state = test_state();
+        state.authoring = Some(authoring_options(vec![authoring_target(
+            "workspace",
+            &["flows/", "resources/"],
+        )]));
+        state.inproc = inproc;
+        let cache = Arc::clone(&state.conversation_cache);
+        tokio::spawn(async move {
+            let event = rx.recv().await.unwrap();
+            let id = event.data_as_json().unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let key = format!("authoring.changes.{id}");
+            let mut stored: api::Change =
+                serde_json::from_slice(&cache.get(&key).await.unwrap().unwrap()).unwrap();
+            stored.title = "Newer".to_string();
+            cache
+                .put(&key, serde_json::to_vec(&stored).unwrap().into(), None)
+                .await
+                .unwrap();
+            event
+                .completion_tx
+                .as_ref()
+                .unwrap()
+                .signal_completion(None);
+        });
+        let base = serve(router("/flowgen", state)).await;
+        let client = reqwest::Client::new();
+        let proposed: api::Change = client
+            .post(format!("{base}/flowgen/api/changes"))
+            .json(&api::ChangeProposal {
+                title: "Add script".to_string(),
+                description: None,
+                files: vec![api::WorkspaceFile {
+                    path: "resources/s.rhai".to_string(),
+                    content: Some("event".to_string()),
+                }],
+            })
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let approved = client
+            .post(format!(
+                "{base}/flowgen/api/changes/{}/approve",
+                proposed.id
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(approved.status(), 200);
+        let stored: api::Change = client
+            .get(format!("{base}/flowgen/api/changes/{}", proposed.id))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(stored.title, "Newer");
+        assert_eq!(stored.status, api::ChangeStatus::Publishing);
+    }
+
+    #[tokio::test]
     async fn api_routes_are_open_without_web_auth() {
         let base = serve(router("/flowgen", test_state())).await;
 
@@ -1622,6 +2521,26 @@ mod tests {
             rejected.is_empty(),
             "rejected without web.auth: {rejected:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn agents_routes_answer_404_unless_web_agents_is_enabled() {
+        let off = serve(router("/flowgen", test_state())).await;
+        let mut state = test_state();
+        state.agents = Some(crate::config::AgentsOptions {
+            enabled: true,
+            conversation_history_ttl: None,
+        });
+        let on = serve(router("/flowgen", state)).await;
+
+        let status = |base: String| async move {
+            reqwest::get(format!("{base}/flowgen/api/agents/conversations"))
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(status(off).await, StatusCode::NOT_FOUND);
+        assert_eq!(status(on).await, StatusCode::OK);
     }
 
     #[cfg(unix)]
@@ -1766,6 +2685,54 @@ mod tests {
     fn removal_cookie_omits_secure_when_cookie_secure_is_off() {
         let removal = removal_cookie(SSO_SESSION_COOKIE, false).to_string();
         assert!(!removal.contains("Secure"), "{removal}");
+    }
+
+    #[test]
+    fn return_path_accepts_pages_under_the_prefix() {
+        assert_eq!(
+            return_path("/flowgen", "/flowgen/agents/abc?x=1#top").as_deref(),
+            Some("/flowgen/agents/abc?x=1#top")
+        );
+        assert_eq!(
+            return_path("/flowgen", "/flowgen/").as_deref(),
+            Some("/flowgen/")
+        );
+        assert_eq!(return_path("", "/logs").as_deref(), Some("/logs"));
+        assert_eq!(
+            return_path("/flowgen", "/flowgen/logs?q=..").as_deref(),
+            Some("/flowgen/logs?q=..")
+        );
+    }
+
+    #[test]
+    fn return_path_rejects_anything_that_could_leave_the_ui() {
+        for rejected in [
+            "https://evil.example/",
+            "//evil.example/",
+            "/\\evil.example/",
+            "/flowgen\\..\\x",
+            "/flowgenx/agents",
+            "/flowgen",
+            "/other/page",
+            "/flowgen/auth/login",
+            "/flowgen/../other/",
+            "/flowgen/%2e%2E/other/",
+            "/flowgen/./agents",
+            "/flowgen/a b",
+            "/flowgen/\r\nSet-Cookie:x",
+        ] {
+            assert_eq!(return_path("/flowgen", rejected), None, "{rejected:?}");
+        }
+        assert_eq!(return_path("", "//evil.example/"), None);
+        assert_eq!(return_path("", "evil.example"), None);
+    }
+
+    #[test]
+    fn a_login_state_cookie_without_return_to_still_parses() {
+        let encoded = r#"{"csrf_state":"s","nonce":"n","pkce_verifier":"v"}"#;
+        let pending: PendingLogin = serde_json::from_str(encoded).unwrap();
+        assert_eq!(pending.login.csrf_state, "s");
+        assert_eq!(pending.return_to, None);
     }
 
     #[test]

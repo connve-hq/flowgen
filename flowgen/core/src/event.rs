@@ -57,27 +57,34 @@ impl CompletionState {
         }
     }
 
+    /// Counts one leaf as done and returns whether it was the last one. The
+    /// count saturates at zero, so a leaf signalling twice cannot underflow it
+    /// and fire completion again.
+    fn last_leaf(&self) -> bool {
+        let mut current = self.remaining.load(Ordering::Acquire);
+        loop {
+            match current {
+                0 => return false,
+                n => match self.remaining.compare_exchange_weak(
+                    n,
+                    n - 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(previous) => return previous == 1,
+                    Err(actual) => current = actual,
+                },
+            }
+        }
+    }
+
     /// Signals completion from a leaf task with its result payload.
     ///
     /// Decrements the outstanding-leaf counter; the leaf that brings it to zero
     /// delivers its payload to the source via the one-shot channel. Earlier
     /// leaves' payloads are dropped. Subsequent calls after delivery are no-ops.
     pub fn signal_completion(&self, payload: Option<serde_json::Value>) {
-        // Saturating decrement protects against accidental double-signal from
-        // a single leaf (which would otherwise underflow `remaining` and
-        // eventually re-trigger the delivery branch).
-        let previous = self.remaining.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| match current {
-                0 => None,
-                n => Some(n - 1),
-            },
-        );
-        // We are the last leaf when the previous value was 1; otherwise
-        // either more leaves are still outstanding or completion already
-        // fired and the counter is saturated at zero.
-        if !matches!(previous, Ok(1)) {
+        if !self.last_leaf() {
             return;
         }
         if let Ok(mut guard) = self.sender.lock() {
@@ -95,15 +102,7 @@ impl CompletionState {
     /// caller as a tool/request error instead of falling back to an opaque
     /// acknowledgement timeout.
     pub fn signal_completion_with_error(&self, error: String) {
-        let previous = self.remaining.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |current| match current {
-                0 => None,
-                n => Some(n - 1),
-            },
-        );
-        if !matches!(previous, Ok(1)) {
+        if !self.last_leaf() {
             return;
         }
         if let Ok(mut guard) = self.sender.lock() {
@@ -379,6 +378,29 @@ impl Event {
     /// Returns true if this event carries an error from a failed upstream task.
     pub fn is_error(&self) -> bool {
         self.error.is_some()
+    }
+
+    /// Hands on an event whose task failed: downstream with `error` set when
+    /// there is a next task that still accepts events, otherwise to the source
+    /// as a failed completion.
+    pub async fn forward_failure(
+        mut self,
+        tx: Option<&tokio::sync::mpsc::Sender<Event>>,
+        error: String,
+    ) {
+        let event = match tx {
+            Some(tx) => {
+                self.error = Some(error.clone());
+                match tx.send(self).await {
+                    Ok(()) => return,
+                    Err(tokio::sync::mpsc::error::SendError(event)) => event,
+                }
+            }
+            None => self,
+        };
+        if let Some(arc) = event.completion_tx.as_ref() {
+            arc.signal_completion_with_error(error);
+        }
     }
 }
 
@@ -1000,5 +1022,58 @@ mod tests {
             }
             _ => panic!("Expected Arrow RecordBatch"),
         }
+    }
+
+    fn event_with_completion() -> (Event, CompletionRx) {
+        let (completion_tx, completion_rx) = new_completion_channel(1);
+        let event = EventBuilder::new()
+            .data(EventData::Json(json!({})))
+            .subject("a".to_string())
+            .task_id(0)
+            .task_type("test")
+            .completion_tx(completion_tx)
+            .build()
+            .unwrap();
+        (event, completion_rx)
+    }
+
+    async fn failure_message(completion_rx: CompletionRx) -> String {
+        match completion_rx.await {
+            Ok(Err(error)) => error.to_string(),
+            other => panic!("Expected a failed completion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_a_next_task_goes_downstream_with_its_error() {
+        let (event, mut completion_rx) = event_with_completion();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        event.forward_failure(Some(&tx), "boom".to_string()).await;
+
+        let forwarded = rx.recv().await.unwrap();
+        assert_eq!(forwarded.error.as_deref(), Some("boom"));
+        assert!(forwarded.completion_tx.is_some());
+        assert!(completion_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failure_at_a_leaf_fails_the_completion() {
+        let (event, completion_rx) = event_with_completion();
+
+        event.forward_failure(None, "boom".to_string()).await;
+
+        assert_eq!(failure_message(completion_rx).await, "boom");
+    }
+
+    #[tokio::test]
+    async fn a_failure_whose_next_task_stopped_fails_the_completion() {
+        let (event, completion_rx) = event_with_completion();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        event.forward_failure(Some(&tx), "boom".to_string()).await;
+
+        assert_eq!(failure_message(completion_rx).await, "boom");
     }
 }

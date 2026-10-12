@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Coalescing window: events that arrive within this window are batched together.
 const DEBOUNCE_WINDOW: Duration = Duration::from_secs(2);
@@ -65,6 +65,35 @@ pub enum Error {
     },
 }
 
+/// How long stopping a flow may take before it is abandoned.
+pub const FLOW_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Shared servers that flows register their endpoints with.
+#[derive(Clone, Default)]
+pub struct FlowServers {
+    pub http_server: Option<Arc<flowgen_http::server::EndpointServer>>,
+    pub mcp_server: Option<Arc<flowgen_mcp::server::McpServer>>,
+    pub ai_gateway_server: Option<Arc<flowgen_ai_agent::ai_gateway::server::AiGatewayServer>>,
+    pub inproc: Arc<flowgen_core::task::inproc::registry::InprocRegistry>,
+}
+
+impl FlowServers {
+    /// Removes `flow` from every server. Each entry holds a sender into the
+    /// flow, so its tasks cannot drain and stop while it is registered.
+    pub fn deregister_flow(&self, flow: &str) {
+        if let Some(http_server) = &self.http_server {
+            http_server.deregister_flow(flow);
+        }
+        self.inproc.deregister_flow(flow);
+        if let Some(mcp_server) = &self.mcp_server {
+            flowgen_mcp::server::deregister_flow_all(mcp_server, flow);
+        }
+        if let Some(ai_gateway_server) = &self.ai_gateway_server {
+            ai_gateway_server.deregister_flow(flow);
+        }
+    }
+}
+
 /// All dependencies the reconciler needs to build and start replacement flows.
 pub struct ReconcilerContext {
     /// Flow cache. Watched for flow YAML changes and used for stale-entry
@@ -81,9 +110,8 @@ pub struct ReconcilerContext {
     pub runtime_cache: Arc<dyn Cache>,
     pub app_config: Arc<crate::config::AppConfig>,
     pub resource_loader: Option<flowgen_core::resource::ResourceLoader>,
-    pub http_server: Option<Arc<flowgen_http::server::EndpointServer>>,
-    pub mcp_server: Option<Arc<flowgen_mcp::server::McpServer>>,
-    pub ai_gateway_server: Option<Arc<flowgen_ai_agent::ai_gateway::server::AiGatewayServer>>,
+    /// Shared servers that flows register their endpoints with.
+    pub servers: FlowServers,
     pub filesystem_flow_paths: Arc<HashSet<String>>,
     pub flow_registry: Arc<RwLock<HashMap<String, FlowHandle>>>,
     pub client_registry: Arc<flowgen_core::client_registry::ClientRegistry>,
@@ -272,6 +300,11 @@ async fn reconcile_put(key: &str, value: bytes::Bytes, ctx: &ReconcilerContext) 
         return;
     }
 
+    if runs_source(&flow_id, config.raw_source.as_deref(), ctx) {
+        debug!(flow = %flow_id, key = %key, "Flow unchanged, keeping it running");
+        return;
+    }
+
     // Build and init before touching the running flow so a broken config leaves it serving.
     let mut new_flow = match build_flow(config, ctx) {
         Ok(f) => f,
@@ -400,6 +433,16 @@ async fn reconcile_put(key: &str, value: bytes::Bytes, ctx: &ReconcilerContext) 
     }
 }
 
+/// Whether `flow_id` is still running from exactly `source`.
+fn runs_source(flow_id: &str, source: Option<&str>, ctx: &ReconcilerContext) -> bool {
+    match (source, ctx.flow_registry.read()) {
+        (Some(source), Ok(registry)) => registry.get(flow_id).is_some_and(|handle| {
+            handle.flow_yaml() == source && !handle.join_handle.is_finished()
+        }),
+        _ => false,
+    }
+}
+
 /// Handles a `Delete` event: stops the flow and deregisters its routes/tools.
 async fn reconcile_delete(key: &str, ctx: &ReconcilerContext) {
     let flow_name = match derive_flow_name(key, ctx) {
@@ -444,28 +487,15 @@ async fn stop_and_deregister(flow_name: &str, ctx: &ReconcilerContext) {
     };
 
     old.cancellation_token.cancel();
+    ctx.servers.deregister_flow(flow_name);
 
-    // Deregister before awaiting: each server entry holds a sender into the
-    // flow, so the flow's tasks cannot drain and stop while it is registered.
-    if let Some(http_server) = &ctx.http_server {
-        http_server.deregister_flow(flow_name);
-    }
-    if let Some(mcp_server) = &ctx.mcp_server {
-        // Bulk-clears tools, resources, and resource templates in one pass.
-        flowgen_mcp::server::deregister_flow_all(mcp_server, flow_name);
-    }
-    if let Some(ai_gateway_server) = &ctx.ai_gateway_server {
-        ai_gateway_server.deregister_flow(flow_name);
-    }
-
-    // Await with a timeout so a stuck flow does not block the reconciler indefinitely.
-    let timeout = Duration::from_secs(30);
-    match tokio::time::timeout(timeout, old.join_handle).await {
+    match tokio::time::timeout(FLOW_STOP_TIMEOUT, old.join_handle).await {
         Ok(Ok(())) => info!(flow = %flow_name, "Old flow stopped"),
         Ok(Err(e)) => warn!(flow = %flow_name, error = %e, "Old flow task panicked or was aborted"),
         Err(_) => warn!(
             flow = %flow_name,
-            "Flow did not stop within 30 seconds, proceeding with deregistration"
+            timeout = ?FLOW_STOP_TIMEOUT,
+            "Flow did not stop in time, proceeding with deregistration"
         ),
     }
 
@@ -505,19 +535,10 @@ fn derive_flow_name(key: &str, ctx: &ReconcilerContext) -> Option<String> {
 /// `FlowConfig::from_path` and retain the verbatim YAML for the web API).
 fn parse_flow_config(key: &str, value: &bytes::Bytes) -> Result<(FlowConfigRaw, String), Error> {
     let content = String::from_utf8_lossy(value).into_owned();
-    let format = match key.ends_with(".json") {
-        true => config::FileFormat::Json,
-        false => config::FileFormat::Yaml,
-    };
-
-    let raw: FlowConfigRaw = config::Config::builder()
-        .add_source(config::File::from_str(&content, format))
-        .build()
-        .and_then(|c| c.try_deserialize::<FlowConfigRaw>())
-        .map_err(|source| Error::FlowConfigParse {
-            key: key.to_string(),
-            source,
-        })?;
+    let raw = FlowConfigRaw::parse(key, &content).map_err(|source| Error::FlowConfigParse {
+        key: key.to_string(),
+        source,
+    })?;
     Ok((raw, content))
 }
 
@@ -556,9 +577,7 @@ fn test_context(prefix: &str) -> ReconcilerContext {
         runtime_cache: Arc::clone(&shared),
         app_config: Arc::new(app_config),
         resource_loader: None,
-        http_server: None,
-        mcp_server: None,
-        ai_gateway_server: None,
+        servers: FlowServers::default(),
         filesystem_flow_paths: Arc::new(HashSet::new()),
         flow_registry: Arc::new(RwLock::new(HashMap::new())),
         client_registry: Arc::new(flowgen_core::client_registry::ClientRegistry::new()),
@@ -581,16 +600,17 @@ fn build_flow(
         .cache(Arc::clone(&ctx.runtime_cache))
         .system_cache(Arc::clone(&ctx.system_cache))
         .client_registry(Arc::clone(&ctx.client_registry))
+        .inproc(Arc::clone(&ctx.servers.inproc))
         .holder_identity(ctx.holder_identity.clone())
         .peer_registry(Arc::clone(&ctx.peer_registry));
 
-    if let Some(server) = &ctx.http_server {
+    if let Some(server) = &ctx.servers.http_server {
         builder = builder.http_server(Arc::clone(server));
     }
-    if let Some(server) = &ctx.mcp_server {
+    if let Some(server) = &ctx.servers.mcp_server {
         builder = builder.mcp_server(Arc::clone(server));
     }
-    if let Some(server) = &ctx.ai_gateway_server {
+    if let Some(server) = &ctx.servers.ai_gateway_server {
         builder = builder.ai_gateway_server(Arc::clone(server));
     }
     if let Some(retry) = ctx.app_config.retry.as_ref() {
@@ -663,9 +683,7 @@ mod tests {
             runtime_cache: Arc::clone(&shared),
             app_config: Arc::new(app_config),
             resource_loader: None,
-            http_server: None,
-            mcp_server: None,
-            ai_gateway_server: None,
+            servers: FlowServers::default(),
             filesystem_flow_paths: Arc::new(HashSet::new()),
             flow_registry: Arc::new(RwLock::new(HashMap::new())),
             client_registry: Arc::new(flowgen_core::client_registry::ClientRegistry::new()),
@@ -797,9 +815,7 @@ flow:
             runtime_cache: Arc::clone(&shared),
             app_config: Arc::new(app_config),
             resource_loader: None,
-            http_server: None,
-            mcp_server: None,
-            ai_gateway_server: None,
+            servers: FlowServers::default(),
             filesystem_flow_paths: Arc::new(fs_flows),
             flow_registry: Arc::new(RwLock::new(HashMap::new())),
             client_registry: Arc::new(flowgen_core::client_registry::ClientRegistry::new()),
@@ -1026,6 +1042,41 @@ flow:
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn hot_reload_with_the_same_source_keeps_the_flow_running() {
+        let ctx = test_context("flows");
+        let started_at = |ctx: &ReconcilerContext| {
+            ctx.flow_registry
+                .read()
+                .expect("read registry")
+                .get("same")
+                .map(FlowHandle::started_at)
+        };
+
+        reconcile_put("flows.same", versioned_flow_yaml(1), &ctx).await;
+        let first = started_at(&ctx);
+        reconcile_put("flows.same", versioned_flow_yaml(1), &ctx).await;
+        let unchanged = started_at(&ctx);
+        reconcile_put("flows.same", versioned_flow_yaml(2), &ctx).await;
+        let changed = started_at(&ctx);
+
+        if let Some(handle) = ctx.flow_registry.read().expect("read registry").get("same") {
+            handle.join_handle.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reconcile_put("flows.same", versioned_flow_yaml(2), &ctx).await;
+        let revived = started_at(&ctx);
+        stop_and_deregister("same", &ctx).await;
+
+        assert!(first.is_some(), "flow should be running");
+        assert_eq!(first, unchanged, "the same source restarted the flow");
+        assert_ne!(first, changed, "a new source should replace the flow");
+        assert_ne!(
+            changed, revived,
+            "the same source should restart a stopped flow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn hot_reload_with_failing_init_keeps_old_flow_running() {
         let ctx = test_context("flows");
         let broken = bytes::Bytes::from(
@@ -1090,7 +1141,7 @@ flow:
         let server = Arc::new(flowgen_http::server::EndpointServer::new(
             "/api".to_string(),
         ));
-        ctx.http_server = Some(Arc::clone(&server));
+        ctx.servers.http_server = Some(Arc::clone(&server));
 
         reconcile_put("flows.hook", webhook_flow_yaml("info"), &ctx).await;
         let reload_started = std::time::Instant::now();

@@ -44,6 +44,8 @@ const TASK_TO_MODULE: Record<string, string> = {
 	script: 'core',
 	buffer: 'core',
 	generate: 'core',
+	inproc_endpoint: 'core',
+	inproc_request: 'core',
 	// ai
 	ai_completion: 'ai',
 	mcp_tool: 'ai',
@@ -59,6 +61,7 @@ const TASK_TO_MODULE: Record<string, string> = {
 	gcp_bigquery_storage_write: 'gcp',
 	// git
 	git_sync: 'git',
+	git_push: 'git',
 	// http
 	http_request: 'http',
 	http_endpoint: 'http',
@@ -79,6 +82,7 @@ const TASK_TO_MODULE: Record<string, string> = {
 	object_store: 'object-store',
 	// oci
 	oci_sync: 'oci',
+	oci_push: 'oci',
 	// salesforce
 	salesforce_pubsubapi_subscriber: 'salesforce',
 	salesforce_pubsubapi_publisher: 'salesforce',
