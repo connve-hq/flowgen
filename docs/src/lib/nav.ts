@@ -95,7 +95,8 @@ export const navigation: NavSection[] = [
 		icon: '/icons/braze.png',
 		items: [
 			{ title: 'Overview', href: '/braze' },
-			{ title: 'Export Users by IDs', href: '/braze/export/users' }
+			{ title: 'Export User Data', href: '/braze/export-user-data' },
+			{ title: 'Messaging', href: '/braze/messaging' }
 		]
 	},
 	{
@@ -147,6 +148,18 @@ export const navigation: NavSection[] = [
 			{ title: 'Overview', href: '/kafka' },
 			{ title: 'Produce', href: '/kafka/produce' },
 			{ title: 'Subscribe', href: '/kafka/subscribe' }
+		]
+	},
+	{
+		title: 'Klaviyo',
+		icon: '/icons/klaviyo.png',
+		items: [
+			{ title: 'Overview', href: '/klaviyo' },
+			{ title: 'Templates', href: '/klaviyo/templates' },
+			{ title: 'Campaigns', href: '/klaviyo/campaigns' },
+			{ title: 'Lists', href: '/klaviyo/lists' },
+			{ title: 'Events', href: '/klaviyo/events' },
+			{ title: 'Profiles', href: '/klaviyo/profiles' }
 		]
 	},
 	{

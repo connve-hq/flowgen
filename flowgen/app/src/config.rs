@@ -263,6 +263,8 @@ task_types! {
     salesforce_restapi_composite(flowgen_salesforce::restapi::config::Composite),
     /// Salesforce REST API SOSL search operations.
     salesforce_restapi_search(flowgen_salesforce::restapi::config::Search),
+    /// Salesforce REST API SOQL queries, following every page of results.
+    salesforce_restapi_query(flowgen_salesforce::restapi::config::Query),
     /// Salesforce SOAP API merge operation for combining duplicate records.
     salesforce_soapapi_merge(flowgen_salesforce::soapapi::config::Merge),
     /// Salesforce Tooling API operations for metadata management.
@@ -297,8 +299,20 @@ task_types! {
     git_push(flowgen_git::push::config::Processor),
     /// OCI push task for releasing files to an OCI registry as an artifact.
     oci_push(flowgen_oci::push::config::Processor),
-    /// Braze export user IDs task.
-    braze_export_users_ids(flowgen_braze::export::users::config::Processor),
+    /// Braze user data export task.
+    braze_export_user_data(flowgen_braze::export_user_data::ExportUserData),
+    /// Braze messaging task.
+    braze_messaging(flowgen_braze::messaging::Messaging),
+    /// Klaviyo email templates task.
+    klaviyo_templates(flowgen_klaviyo::templates::Templates),
+    /// Klaviyo campaigns task.
+    klaviyo_campaigns(flowgen_klaviyo::campaigns::Campaigns),
+    /// Klaviyo lists task.
+    klaviyo_lists(flowgen_klaviyo::lists::Lists),
+    /// Klaviyo events task.
+    klaviyo_events(flowgen_klaviyo::events::Events),
+    /// Klaviyo profiles task.
+    klaviyo_profiles(flowgen_klaviyo::profiles::Profiles),
     /// MongoDB collection read/write task.
     mongodb_collection(flowgen_mongodb::config::Collection),
     /// MongoDB change stream reader task.
@@ -361,6 +375,7 @@ impl TaskType {
             TaskType::salesforce_restapi_sobject(c) => c.depends_on.as_ref(),
             TaskType::salesforce_restapi_composite(c) => c.depends_on.as_ref(),
             TaskType::salesforce_restapi_search(c) => c.depends_on.as_ref(),
+            TaskType::salesforce_restapi_query(c) => c.depends_on.as_ref(),
             TaskType::salesforce_soapapi_merge(c) => c.depends_on.as_ref(),
             TaskType::salesforce_toolingapi(c) => c.depends_on.as_ref(),
             TaskType::gcp_bigquery_query(c) => c.depends_on.as_ref(),
@@ -378,7 +393,13 @@ impl TaskType {
             TaskType::oci_sync(c) => c.depends_on.as_ref(),
             TaskType::git_push(c) => c.depends_on.as_ref(),
             TaskType::oci_push(c) => c.depends_on.as_ref(),
-            TaskType::braze_export_users_ids(c) => c.depends_on.as_ref(),
+            TaskType::braze_export_user_data(c) => c.depends_on.as_ref(),
+            TaskType::braze_messaging(c) => c.depends_on.as_ref(),
+            TaskType::klaviyo_templates(c) => c.depends_on.as_ref(),
+            TaskType::klaviyo_campaigns(c) => c.depends_on.as_ref(),
+            TaskType::klaviyo_lists(c) => c.depends_on.as_ref(),
+            TaskType::klaviyo_events(c) => c.depends_on.as_ref(),
+            TaskType::klaviyo_profiles(c) => c.depends_on.as_ref(),
             TaskType::mongodb_collection(c) => c.depends_on.as_ref(),
             TaskType::mongodb_change_stream(c) => c.depends_on.as_ref(),
             TaskType::kafka_produce(c) => c.depends_on.as_ref(),
@@ -771,15 +792,13 @@ pub struct WebOptions {
     pub headers: std::collections::HashMap<String, String>,
     /// OIDC login for the web UI (Okta, Zitadel, Auth0, or any
     /// standard-compliant IdP). Omit to leave the web UI unauthenticated.
-    /// When set, a cookie secret is required — see [`Self::cookie_secret`].
     #[serde(default)]
     pub auth: Option<crate::login::LoginConfig>,
     /// Key used to encrypt the browser session cookie (holds the IdP's
     /// tokens — flowgen keeps no server-side session store, see
-    /// `crate::login`). At least 64 bytes recommended; shorter values are
-    /// expanded via HKDF, but a short secret is still a short secret.
-    /// Required when `auth` is set, unless `auth.credentials_path` carries a
-    /// `cookie_secret` instead.
+    /// `crate::login`). At least 32 bytes. Unset, flowgen generates the key
+    /// and keeps it in the system bucket; `auth.credentials_path` can carry
+    /// a `cookie_secret` instead.
     #[serde(default, serialize_with = "serialize_redacted_cookie_secret")]
     pub cookie_secret: Option<secrecy::SecretString>,
     /// Whether the login cookies carry the `Secure` attribute, which browsers
